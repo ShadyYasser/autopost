@@ -273,9 +273,10 @@ class State:
 
     # ------------------------------------------------------------ caption cursor
 
-    def caption_cursor(self, brand: str) -> int | None:
-        r = self._exec("SELECT last_row FROM caption_cursor WHERE brand=?", (brand,)).fetchone()
-        return None if r is None else r[0]
+    def caption_cursor(self, brand: str) -> tuple[int, datetime] | None:
+        """(last sheet row used, when) or None."""
+        r = self._exec("SELECT last_row, updated_utc FROM caption_cursor WHERE brand=?", (brand,)).fetchone()
+        return None if r is None else (r[0], from_utc_str(r[1]))
 
     def set_caption_cursor(self, brand: str, row: int, now: datetime) -> None:
         self._exec("INSERT INTO caption_cursor VALUES (?,?,?) ON CONFLICT(brand) DO UPDATE SET "

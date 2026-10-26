@@ -30,15 +30,15 @@ slots:
 
 text_source:
   type: sheet
-  sheet_id: "REPLACE_WITH_SHEET_ID"
-  worksheet: null              # null = first worksheet
-  header_rows: 1
+  sheet_id: "11RXgOmoDxR680kN5Fvq9Q9Mqb5Xy0cI55NpUNmBMxtc"
+  worksheet_index: 0           # first tab, whatever its name
+  header_rows: 1               # row 1 = caption | title | posted_at
   columns: { caption: A, title: B }
   posted_at_column: C
 
 streams:
   main:
-    drive_folder_id: "REPLACE_WITH_DRIVE_FOLDER_ID"
+    drive_folder_id: "1YFMErkAWf1WvmY547qbShBk0DT5lSBQR"
     slots: [fajr, maghrib, third]
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
 

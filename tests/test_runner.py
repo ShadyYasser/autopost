@@ -229,3 +229,39 @@ def test_slots_created_after_their_time_are_skipped_quietly(app, tmp_path):
     yesterday = state.slots(brand="takwin", days=[TZ_DAY - timedelta(days=1)])
     assert yesterday and all(s.status == "skipped" for s in yesterday if s.window != "night")
     assert notifier.sent == []
+
+
+class BrokenContent(FakeContent):
+    def pick_text(self, brand, stream, video):
+        raise RuntimeError("Sheets API unavailable")
+
+
+class SheetWriteFails(FakeContent):
+    def commit_text(self, brand, choice, when):
+        raise RuntimeError("could not write the posted date to sheet row 7")
+
+
+def test_content_error_keeps_slot_for_next_run(app, tmp_path):
+    state = prepare_slots(app, tmp_path, "kalima_sawaa")
+    s = slot(state, "kalima_sawaa", "morning")
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target, brand="kalima_sawaa",
+                                                         state=state, content=BrokenContent())
+    runner.run()
+    assert pub.calls == [] and state.recent_posts() == []
+    assert slot(state, "kalima_sawaa", "morning").status == "scheduled"
+    assert any("could not prepare content" in m and "retried" in m for m in notifier.sent)
+    # next run, content is back
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target + timedelta(minutes=30),
+                                                         brand="kalima_sawaa", state=state)
+    runner.run()
+    assert slot(state, "kalima_sawaa", "morning").status == "done"
+
+
+def test_sheet_write_failure_alerts_but_publishes(app, tmp_path):
+    state = prepare_slots(app, tmp_path, "takwin")
+    s = slot(state, "takwin", "third")
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target, brand="takwin",
+                                                         state=state, content=SheetWriteFails())
+    runner.run()
+    assert len([c for c in pub.calls if c[0] == "takwin"]) >= 5
+    assert any("sheet row 7" in m for m in notifier.sent)

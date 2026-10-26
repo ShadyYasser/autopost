@@ -43,6 +43,8 @@ class ContentSource(Protocol):
 
     def release(self, video: VideoItem) -> None: ...
 
+    def probe(self, video: VideoItem): ...
+
 
 class PlaceholderContent:
     """Endless fake videos for dry runs before the Drive integration (phase 2) is configured."""
@@ -73,3 +75,8 @@ class PlaceholderContent:
 
     def release(self, video: VideoItem) -> None:
         pass
+
+    def probe(self, video: VideoItem):
+        from ..media import from_drive
+
+        return from_drive(video.width, video.height, video.duration_ms)

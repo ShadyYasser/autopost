@@ -13,7 +13,7 @@ on:
       command:
         description: "What to run"
         type: choice
-        options: [run, validate, plan, status]
+        options: [run, sources, validate, plan, status]
         default: run
       brand:
         description: "Only this brand id (empty = all)"
@@ -23,6 +23,10 @@ on:
         description: "Dry run only: pretend it is this local time, e.g. 2026-10-27T17:37"
         type: string
         default: ""
+      download:
+        description: "Dry run only: also download each video and check it with ffprobe"
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # commit state/state.db and manage the media-temp release
@@ -46,6 +50,7 @@ jobs:
       COMMAND: ${{ github.event_name == 'workflow_dispatch' && inputs.command || 'run' }}
       BRAND: ${{ github.event_name == 'workflow_dispatch' && inputs.brand || '' }}
       NOW: ${{ github.event_name == 'workflow_dispatch' && inputs.now || '' }}
+      DOWNLOAD: ${{ github.event_name == 'workflow_dispatch' && inputs.download || false }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +60,9 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          command -v ffprobe >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null)
 
       - name: Run
         env:
@@ -68,7 +75,9 @@ jobs:
               [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
               [ -n "$BRAND" ] && args+=(--brand "$BRAND")
               [ -n "$NOW" ] && args+=(--now "$NOW")
+              [ "$DOWNLOAD" = "true" ] && args+=(--download)
               ;;
+            sources) [ -n "$BRAND" ] && args+=(--brand "$BRAND") ;;
             validate) args+=(--check-secrets) ;;
             plan) [ -n "$BRAND" ] && args+=(--brand "$BRAND") ;;
           esac

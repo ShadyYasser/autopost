@@ -157,6 +157,8 @@ class Settings(_Model):
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     max_attempts_per_delivery: int = Field(3, ge=1)
     low_content_warning_days: int = Field(3, ge=0)
+    # Override built-in text limits, e.g. {instagram: {text: 2000}}
+    text_limits: dict[str, dict[str, int]] = Field(default_factory=dict)
     daily_summary_time: str = "23:30"
     google: GoogleConfig
     telegram: TelegramConfig
@@ -283,7 +285,7 @@ SlotConfig = Annotated[
 class SheetTextSource(_Model):
     type: Literal["sheet"]
     sheet_id: str
-    worksheet: str | None = None
+    worksheet_index: int = Field(0, ge=0)   # 0 = first tab (by position, not by name)
     header_rows: int = Field(1, ge=0)
     columns: dict[str, str]
     posted_at_column: str = "C"
@@ -294,16 +296,30 @@ class SheetTextSource(_Model):
         for name, col in v.items():
             if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
                 raise ValueError(f"column variable name {name!r} is not a valid identifier")
-            if not re.match(r"^[A-Z]{1,2}$", col):
-                raise ValueError(f"column for {name!r} must be a letter like A, got {col!r}")
+            _check_column(col, name)
         return v
+
+    @field_validator("posted_at_column")
+    @classmethod
+    def _posted(cls, v: str) -> str:
+        return _check_column(v, "posted_at_column")
 
     def variables(self) -> set[str]:
         return set(self.columns)
 
 
+def _check_column(col: str, name: str) -> str:
+    if not re.match(r"^[A-Z]{1,2}$", col):
+        raise ValueError(f"column for {name!r} must be a letter like A, got {col!r}")
+    return col
+
+
 class FilenameTextSource(_Model):
     type: Literal["filename"]
+    # Removed from the start of the title (e.g. Drive's "Copy of " when a file was copied).
+    strip_prefixes: list[str] = Field(default_factory=list)
+    # Character replacements applied to the title (e.g. full-width "：" back to ":").
+    replacements: dict[str, str] = Field(default_factory=dict)
 
     def variables(self) -> set[str]:
         return {"title"}
@@ -352,16 +368,13 @@ class TemplateConfig(_Model):
 
 
 class StreamConfig(_Model):
-    drive_folder_id: str | None = None
-    subfolder: str | None = None
+    drive_folder_id: str
     slots: list[str] = Field(min_length=1)
     platforms: list[PlatformName] = Field(min_length=1)
     overrides: dict[PlatformName, dict[str, Any]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _folder(self) -> "StreamConfig":
-        if (self.drive_folder_id is None) == (self.subfolder is None):
-            raise ValueError("a stream needs exactly one of `drive_folder_id` or `subfolder`")
         if len(set(self.platforms)) != len(self.platforms):
             raise ValueError("duplicate platform in stream")
         return self
@@ -375,7 +388,6 @@ class BrandConfig(_Model):
     prayer_times: PrayerTimesConfig | None = None
     min_slot_spacing_minutes: int | None = Field(None, ge=0)
     text_source: TextSource
-    drive_parent_folder_id: str | None = None
     streams: dict[str, StreamConfig] = Field(min_length=1)
     templates: dict[PlatformName, TemplateConfig]
     platforms: dict[PlatformName, PlatformConfig]
@@ -468,8 +480,6 @@ def validate_brand(brand: BrandConfig, settings: Settings) -> list[str]:
         for slot in stream.slots:
             if slot not in brand.slots:
                 errors.append(f"{sp}: unknown slot {slot!r} (defined: {sorted(brand.slots)})")
-        if stream.subfolder is not None and not brand.drive_parent_folder_id:
-            errors.append(f"{sp}: `subfolder` needs `drive_parent_folder_id` on the brand")
         for platform in stream.overrides:
             if platform not in stream.platforms:
                 errors.append(f"{sp}: override for {platform} which the stream does not publish to")

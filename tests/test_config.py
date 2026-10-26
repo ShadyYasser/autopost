@@ -33,7 +33,8 @@ def test_shipped_config_loads(app):
 
 
 def test_placeholders_reported(app):
-    assert "brands.takwin.text_source.sheet_id" in placeholder_values(app)
+    assert "brands.takwin.platforms.pinterest.board_id" in placeholder_values(app)
+    assert not any("drive_folder_id" in p or "sheet_id" in p for p in placeholder_values(app))
 
 
 def test_required_secrets_follow_config(app):

@@ -50,6 +50,7 @@ class Chain:
     ready_at: datetime
     gap: tuple[int, int]
     outstanding_checks: int = 0
+    media: object | None = None
     skipped_deadline: list[str] = field(default_factory=list)
 
     @property
@@ -183,26 +184,47 @@ class Runner:
         self.state.set_slot_status(brand.id, slot.slot_date, slot.slot, "in_progress", now)
         gap = self.gap_for(brand, slot.slot)
         chains: list[Chain] = []
+        errors: list[str] = []
         for stream in brand.streams_for_slot(slot.slot):
-            video = self.content.next_video(brand.id, stream)
-            if video is None:
-                self.notifier.alert(
-                    f"{brand.name}: no unposted videos left in stream '{stream}'. Slot {slot.slot} skipped for it.",
-                    key=f"empty:{brand.id}:{stream}:{self.local_today(now)}", state=self.state, now=now)
+            try:
+                video = self.content.next_video(brand.id, stream)
+                if video is None:
+                    self.notifier.alert(
+                        f"{brand.name}: no unposted videos left in stream '{stream}'. Slot {slot.slot} skipped for it.",
+                        key=f"empty:{brand.id}:{stream}:{self.local_today(now)}", state=self.state, now=now)
+                    continue
+                text = self.content.pick_text(brand.id, stream, video)
+            except Exception as exc:  # noqa: BLE001 - Drive/Sheets trouble must not crash the run
+                log.exception("%s/%s: content error", brand.id, stream)
+                errors.append(f"{stream}: {exc}")
                 continue
-            text = self.content.pick_text(brand.id, stream, video)
             platforms = list(brand.streams[stream].platforms)
             self.rng.shuffle(platforms)
             routing = [(p, brand.platform_for(stream, p).provider) for p in platforms]
             post_id = self.state.create_post(brand.id, stream, slot.slot_date, slot.slot, video.id, video.name,
                                              video.created, text.row, text.variables, routing, now)
-            self.content.commit_text(brand.id, text, now)
+            try:
+                self.content.commit_text(brand.id, text, now)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("commit_text failed")
+                self.notifier.alert(f"{brand.name}: {exc}. Rotation continues from the position saved in state.")
             log.info("  post #%s %s/%s: %s, order %s", post_id, brand.id, stream, video.name,
                      " → ".join(p for p, _ in routing))
             ids = deque(d.id for d in self.state.deliveries(post_id))
             ready = now if not chains else now + self.random_gap(gap)
             chains.append(Chain(brand, stream, slot, post_id, video, text.variables, ids, ready, gap))
-            self.warn_low_content(brand, stream, now)
+            try:
+                self.warn_low_content(brand, stream, now)
+            except Exception:  # noqa: BLE001
+                log.exception("low-content check failed")
+        if errors:
+            self.notifier.alert(f"{label}: could not prepare content:\n" + "\n".join(errors)
+                                + ("\nThe slot will be retried on the next run." if not chains else ""),
+                                key=f"content-error:{brand.id}:{slot.slot_date}:{slot.slot}", state=self.state, now=now)
+        if not chains and errors:
+            # Nothing was used up: leave the slot for the next run (it is skipped there if too late).
+            self.state.set_slot_status(brand.id, slot.slot_date, slot.slot, "scheduled", now)
+            return []
         if not chains:
             self.state.set_slot_status(brand.id, slot.slot_date, slot.slot, "skipped", now, note="no content")
             self.report.skipped.append(label)
@@ -319,16 +341,22 @@ class Runner:
 
     def context(self, chain: Chain, d: DeliveryRow) -> PublishContext:
         cfg = chain.brand.platform_for(chain.stream, d.platform)
-        texts = render(chain.brand.templates[d.platform], d.platform, chain.variables)
+        texts = render(chain.brand.templates[d.platform], d.platform, chain.variables, self.settings.text_limits)
 
         def fetch():
             if chain.video.local_path is None:
                 chain.video.local_path = self.content.fetch(chain.video)
             return chain.video.local_path
 
+        def media_info():
+            if chain.media is None:
+                chain.media = self.content.probe(chain.video)
+            return chain.media
+
         return PublishContext(brand=chain.brand, stream=chain.stream, platform=d.platform, cfg=cfg,
                               post_id=chain.post_id, video=chain.video, texts=texts,
-                              deadline=chain.slot.deadline, services=self.services, fetch_video=fetch)
+                              deadline=chain.slot.deadline, services=self.services, fetch_video=fetch,
+                              media_info=media_info)
 
     def process_next(self, chain: Chain, checks: list[Check]) -> None:
         d = self.state.delivery(chain.queue.popleft())

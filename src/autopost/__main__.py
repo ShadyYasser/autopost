@@ -17,6 +17,9 @@ from .alerts.telegram import Notifier
 from .clock import RealClock, SimClock
 from .config import AppConfig, ConfigError, load_config, placeholder_values
 from .content.base import PlaceholderContent
+from .content.drive_source import ContentError, DriveContent, choose_next_row
+from .content.google_api import GoogleClient, GoogleError, session_from_service_account
+from .content.text import render
 from .platforms.base import DryRunPublisher
 from .prayer import PrayerCalculator
 from .runner import Runner
@@ -61,6 +64,36 @@ def make_notifier(app: AppConfig, secrets: Secrets, dry_run: bool) -> Notifier:
         log.warning("Telegram is not configured (%s / %s); alerts only go to the log",
                     tg.bot_token_secret, tg.chat_id_secret)
     return Notifier(token, chat, dry_run=dry_run)
+
+
+def work_dir() -> Path:
+    return Path(os.environ.get("RUNNER_TEMP") or ROOT / "work") / "autopost-media"
+
+
+def open_state(path: str | Path, throwaway: bool) -> tuple[State, str | None]:
+    """Open state; with throwaway=True work on a temporary copy that is deleted afterwards."""
+    if not throwaway:
+        return State(path), None
+    tmpdir = tempfile.mkdtemp(prefix="autopost-dry-")
+    copy = Path(tmpdir) / "state.db"
+    if Path(path).exists():
+        shutil.copy(path, copy)
+    return State(copy), tmpdir
+
+
+def make_content(app: AppConfig, state: State, secrets: Secrets, dry_run: bool, placeholder: bool = False):
+    if placeholder:
+        log.warning("using placeholder content (fake videos and texts)")
+        return PlaceholderContent()
+    name = app.settings.google.service_account_secret
+    if not secrets.has(name):
+        if dry_run:
+            log.warning("%s is not set: dry run uses placeholder content", name)
+            return PlaceholderContent()
+        raise MissingSecret(name)
+    session, email = session_from_service_account(secrets.get(name))
+    log.info("Google: service account %s", email)
+    return DriveContent(app, state, GoogleClient(session), work_dir(), dry_run)
 
 
 def parse_now(value: str | None, app: AppConfig) -> datetime | None:
@@ -147,16 +180,8 @@ def cmd_run(args, app: AppConfig) -> int:
         return 2
 
     secrets = Secrets()
-    state_path = Path(args.state)
-    tmpdir = None
-    if dry:
-        # Dry runs work on a throwaway copy so nothing they do is ever committed.
-        tmpdir = tempfile.mkdtemp(prefix="autopost-dry-")
-        copy = Path(tmpdir) / "state.db"
-        if state_path.exists():
-            shutil.copy(state_path, copy)
-        state_path = copy
-    state = State(state_path)
+    # Dry runs work on a throwaway copy of the state so nothing they do is ever committed.
+    state, tmpdir = open_state(args.state, throwaway=dry)
     now = parse_now(args.now, app)
     if dry and not args.real_sleep:
         clock = SimClock(now or datetime.now(app.settings.tz))
@@ -167,8 +192,8 @@ def cmd_run(args, app: AppConfig) -> int:
         clock = RealClock(app.settings.tz)
     use_clock_for_logs(app.settings.tz, clock.now if clock.simulated else None)
     notifier = make_notifier(app, secrets, dry_run=dry)
-    content = PlaceholderContent()
-    dry_pub = DryRunPublisher()
+    content = make_content(app, state, secrets, dry, placeholder=args.placeholder_content)
+    dry_pub = DryRunPublisher(download=args.download)
     runner = Runner(
         app, state, clock, notifier, content,
         publishers=lambda platform, provider: dry_pub,
@@ -186,6 +211,74 @@ def cmd_run(args, app: AppConfig) -> int:
             shutil.rmtree(tmpdir, ignore_errors=True)
     print(report.summary())
     return 0
+
+
+def cmd_sources(args, app: AppConfig) -> int:
+    """Read-only preview of what each stream would publish next."""
+    secrets = Secrets()
+    state, tmpdir = open_state(args.state, throwaway=True)
+    try:
+        content = make_content(app, state, secrets, dry_run=True)
+        if not isinstance(content, DriveContent):
+            print("Google credentials missing; nothing to show", file=sys.stderr)
+            return 1
+        problems = 0
+        for brand in app.enabled_brands():
+            if args.brand and brand.id != args.brand:
+                continue
+            print(f"\n=== {brand.id} ({brand.name}) ===")
+            src = brand.text_source
+            if getattr(src, "type", "") == "sheet":
+                try:
+                    can_edit = content.client.can_edit(src.sheet_id)
+                    rows = content.sheet_rows(brand.id)
+                    usable = [r for r in rows if all(r.values.values())]
+                    last = max((r for r in rows if r.posted_at), key=lambda r: (r.posted_at, r.number), default=None)
+                    print(f"sheet tab {content.sheet_tab(brand.id)}: {len(rows)} data rows, {len(usable)} usable, "
+                          f"service account can edit: {'yes' if can_edit else 'NO'}"
+                          + (f", last posted row {last.number} at {last.posted_at:%Y-%m-%d %H:%M}" if last else ""))
+                    if not can_edit:
+                        problems += 1
+                except (ContentError, GoogleError) as exc:
+                    print(f"  ✗ sheet: {exc}")
+                    problems += 1
+            for stream_name, stream in brand.streams.items():
+                try:
+                    listing = content.listing(brand.id, stream_name)
+                    unused = content.unused(brand.id, stream_name)
+                except ContentError as exc:
+                    print(f"  ✗ {stream_name}: {exc}")
+                    problems += 1
+                    continue
+                per_day = len(stream.slots)
+                print(f"-- stream {stream_name}: {len(listing)} videos, {len(listing) - len(unused)} used, "
+                      f"{len(unused)} left ≈ {len(unused) / per_day:.1f} days at {per_day}/day")
+                cursor = state.caption_cursor(brand.id)
+                for i, video in enumerate(unused[: args.count]):
+                    info = content.probe(video)
+                    created = video.created.astimezone(app.settings.tz).strftime("%Y-%m-%d %H:%M") if video.created else "?"
+                    print(f"  {i + 1}. {video.name}  [created {created}, {video.size or 0:,} B, "
+                          f"{info.describe() if info else 'no media metadata yet'}]")
+                    try:
+                        if getattr(src, "type", "") == "sheet":
+                            row = choose_next_row(content.sheet_rows(brand.id), cursor)
+                            cursor = (row.number, datetime.now(app.settings.tz) + timedelta(days=i + 1))
+                            variables, where = row.values, f"sheet row {row.number}"
+                        else:
+                            variables, where = content.pick_text(brand.id, stream_name, video).variables, "file name"
+                    except ContentError as exc:
+                        print(f"     ✗ text: {exc}")
+                        problems += 1
+                        continue
+                    for platform in stream.platforms:
+                        texts = render(brand.templates[platform], platform, variables, app.settings.text_limits)
+                        shown = "  ".join(f"{k}[{len(v)}]: {v[:70].replace(chr(10), ' ')}{'…' if len(v) > 70 else ''}"
+                                          for k, v in texts.items())
+                        print(f"     {platform:<9} ({where}) {shown}")
+        return 1 if problems else 0
+    finally:
+        state.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def cmd_status(args, app: AppConfig) -> int:
@@ -233,6 +326,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--now", help="dry-run only: pretend it is this local time (YYYY-MM-DDTHH:MM)")
     p.add_argument("--real-sleep", action="store_true", help="dry-run only: really wait instead of simulating")
     p.add_argument("--max-runtime-minutes", type=int, default=120)
+    p.add_argument("--download", action="store_true", help="dry-run: also download each video and ffprobe it")
+    p.add_argument("--placeholder-content", action="store_true", help="dry-run: fake videos instead of Drive")
+
+    p = sub.add_parser("sources", help="read-only preview of Drive videos and sheet texts")
+    p.add_argument("--brand")
+    p.add_argument("--count", type=int, default=3, help="videos to preview per stream")
 
     sub.add_parser("status", help="show state")
 
@@ -245,9 +344,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     use_clock_for_logs(app.settings.tz)
     try:
-        return {"validate": cmd_validate, "plan": cmd_plan, "run": cmd_run, "status": cmd_status}[args.command](
+        return {"validate": cmd_validate, "plan": cmd_plan, "run": cmd_run, "sources": cmd_sources,
+                "status": cmd_status}[args.command](
             args, app)
-    except MissingSecret as exc:
+    except (MissingSecret, GoogleError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

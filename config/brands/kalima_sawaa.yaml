@@ -9,16 +9,21 @@ slots:
 
 text_source:
   type: filename               # {title} = file name without extension
-
-drive_parent_folder_id: "REPLACE_WITH_PARENT_FOLDER_ID"
+  strip_prefixes: ["Copy of ", "نسخة من "]
+  replacements:                # full-width characters that downloaders put in file names
+    "：": ":"
+    "？": "?"
+    "｜": "|"
+    "＂": "\""
+    "⧸": "/"
 
 streams:
   short:
-    subfolder: short
+    drive_folder_id: "1qf_opI5CAtrP5iDn3goNxAZY23rj7Z4c"
     slots: [morning, afternoon, night]
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
   long:
-    subfolder: long
+    drive_folder_id: "1MKCjqE2rKpeT3dGfYtwe7LmYhnZ6CGdP"
     slots: [night]             # night slot posts BOTH a short and a long video
     platforms: [youtube, facebook]
     overrides:
