@@ -1,0 +1,9 @@
+[project]
+name = "autopost"
+version = "0.1.0"
+description = "Config-driven Arabic multi-brand video auto-publisher (GitHub Actions)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

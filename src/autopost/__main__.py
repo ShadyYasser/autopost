@@ -1,0 +1,256 @@
+"""Command line entry point: python -m autopost <command>."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+from .alerts.telegram import Notifier
+from .clock import RealClock, SimClock
+from .config import AppConfig, ConfigError, load_config, placeholder_values
+from .content.base import PlaceholderContent
+from .platforms.base import DryRunPublisher
+from .prayer import PrayerCalculator
+from .runner import Runner
+from .scheduler import ScheduleError, plan_brand_day
+from .secret_store import MissingSecret, Secrets
+from .state import State
+
+log = logging.getLogger("autopost")
+ROOT = Path(__file__).resolve().parents[2]
+
+
+class ClockFormatter(logging.Formatter):
+    """Log timestamps in the brand timezone, taken from the run's clock (so dry runs show simulated time)."""
+
+    def __init__(self, tz, now=None):
+        super().__init__("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+        self.tz = tz
+        self.now = now
+
+    def formatTime(self, record, datefmt=None):  # noqa: N802 - logging API
+        when = self.now() if self.now else datetime.fromtimestamp(record.created, self.tz)
+        return when.astimezone(self.tz).strftime("%m-%d %H:%M:%S")
+
+
+def use_clock_for_logs(tz, now=None) -> None:
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(ClockFormatter(tz, now))
+
+
+def setup_logging(verbose: bool) -> None:
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+    # Library loggers can print request URLs, and Telegram URLs contain the bot token.
+    for noisy in ("urllib3", "requests", "googleapiclient", "google"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def make_notifier(app: AppConfig, secrets: Secrets, dry_run: bool) -> Notifier:
+    tg = app.settings.telegram
+    token = secrets.get(tg.bot_token_secret) if secrets.has(tg.bot_token_secret) else None
+    chat = secrets.get(tg.chat_id_secret) if secrets.has(tg.chat_id_secret) else None
+    if not (token and chat):
+        log.warning("Telegram is not configured (%s / %s); alerts only go to the log",
+                    tg.bot_token_secret, tg.chat_id_secret)
+    return Notifier(token, chat, dry_run=dry_run)
+
+
+def parse_now(value: str | None, app: AppConfig) -> datetime | None:
+    if not value:
+        return None
+    dt = datetime.fromisoformat(value)
+    return dt.replace(tzinfo=app.settings.tz) if dt.tzinfo is None else dt
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_validate(args, app: AppConfig) -> int:
+    print(f"config OK: {len(app.brands)} brand(s): " + ", ".join(
+        f"{b.id}{'' if b.enabled else ' (disabled)'}" for b in app.brands.values()))
+    print(f"cron_enabled={app.settings.cron_enabled}  youtube_direct.enabled={app.settings.youtube_direct.enabled}"
+          f"  pinterest={app.settings.pinterest.environment}")
+    problems = 0
+    for path in placeholder_values(app):
+        print(f"  ! placeholder still set: {path}")
+        problems += 1
+    secrets = Secrets()
+    for name, where in sorted(app.required_secrets().items()):
+        ok = secrets.has(name)
+        if args.check_secrets or ok:
+            print(f"  {'✓' if ok else '✗'} secret {name}  (used by {', '.join(sorted(set(where)))})")
+        if args.check_secrets and not ok:
+            problems += 1
+    if args.ping_telegram:
+        notifier = make_notifier(app, secrets, dry_run=False)
+        if notifier.dry_run or not notifier.send("✅ autopost: Telegram connection works."):
+            print("  ✗ Telegram test message failed")
+            problems += 1
+        else:
+            print("  ✓ Telegram test message sent")
+    return 1 if problems and args.strict else 0
+
+
+def cmd_plan(args, app: AppConfig) -> int:
+    tz = app.settings.tz
+    start = date.fromisoformat(args.date) if args.date else datetime.now(tz).date()
+    rng = random.Random(args.seed) if args.seed is not None else random.SystemRandom()
+    for i in range(args.days):
+        day = start + timedelta(days=i)
+        for brand in app.enabled_brands():
+            if args.brand and brand.id != args.brand:
+                continue
+            pcfg = app.prayer_config(brand)
+            extra = ""
+            if pcfg and any(s.uses_prayer() for s in brand.slots.values()):
+                t = PrayerCalculator(pcfg, tz).times(day)
+                extra = f"  [fajr {t['fajr']:%H:%M}, maghrib {t['maghrib']:%H:%M}]"
+            print(f"{day} {brand.id}{extra}")
+            try:
+                plans = plan_brand_day(app, brand, day, rng)
+            except ScheduleError as exc:
+                print(f"   ERROR: {exc}")
+                continue
+            for p in plans:
+                when = p.target.astimezone(tz)
+                next_day = " (+1d)" if when.date() != day else ""
+                dl = f"  deadline {p.deadline.astimezone(tz):%H:%M}" if p.deadline else ""
+                win = f"  window={p.window}" if p.window else ""
+                streams = ",".join(brand.streams_for_slot(p.slot))
+                print(f"   {p.slot:<10} {when:%H:%M:%S}{next_day}{dl}{win}  streams={streams}")
+    print("\n(preview only: real targets are drawn once per day by the run and stored in state)")
+    return 0
+
+
+def commit_state(reason: str) -> None:
+    script = ROOT / "scripts" / "commit_state.sh"
+    result = subprocess.run(["bash", str(script), reason], cwd=ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.error("state commit failed: %s", (result.stderr or result.stdout)[-500:])
+
+
+def cmd_run(args, app: AppConfig) -> int:
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and not app.settings.cron_enabled:
+        log.info("cron_enabled is false in config/settings.yaml: scheduled run does nothing")
+        return 0
+    dry = args.dry_run
+    if not dry:
+        print("Real publishing is not implemented yet (phases 3–4). Use --dry-run.", file=sys.stderr)
+        return 2
+
+    secrets = Secrets()
+    state_path = Path(args.state)
+    tmpdir = None
+    if dry:
+        # Dry runs work on a throwaway copy so nothing they do is ever committed.
+        tmpdir = tempfile.mkdtemp(prefix="autopost-dry-")
+        copy = Path(tmpdir) / "state.db"
+        if state_path.exists():
+            shutil.copy(state_path, copy)
+        state_path = copy
+    state = State(state_path)
+    now = parse_now(args.now, app)
+    if dry and not args.real_sleep:
+        clock = SimClock(now or datetime.now(app.settings.tz))
+    else:
+        if now:
+            print("--now only works in dry-run without --real-sleep", file=sys.stderr)
+            return 2
+        clock = RealClock(app.settings.tz)
+    use_clock_for_logs(app.settings.tz, clock.now if clock.simulated else None)
+    notifier = make_notifier(app, secrets, dry_run=dry)
+    content = PlaceholderContent()
+    dry_pub = DryRunPublisher()
+    runner = Runner(
+        app, state, clock, notifier, content,
+        publishers=lambda platform, provider: dry_pub,
+        secrets=secrets,
+        dry_run=dry,
+        brand_filter=args.brand or None,
+        checkpoint=commit_state if os.environ.get("AUTOPOST_COMMIT_STATE") == "1" else None,
+        max_runtime_minutes=args.max_runtime_minutes,
+    )
+    try:
+        report = runner.run()
+    finally:
+        state.close()
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    print(report.summary())
+    return 0
+
+
+def cmd_status(args, app: AppConfig) -> int:
+    state = State(args.state)
+    tz = app.settings.tz
+    today = datetime.now(tz).date()
+    print("slots (yesterday → tomorrow):")
+    for s in state.slots(days=[today - timedelta(days=1), today, today + timedelta(days=1)]):
+        dl = f" deadline {s.deadline.astimezone(tz):%H:%M}" if s.deadline else ""
+        print(f"  {s.slot_date} {s.brand:<14} {s.slot:<10} {s.target.astimezone(tz):%m-%d %H:%M}{dl}"
+              f"  {s.status}{'  (' + s.note + ')' if s.note else ''}")
+    print("recent posts:")
+    for p in state.recent_posts(10):
+        ds = ", ".join(f"{d.platform}:{d.status}" for d in state.deliveries(p["id"]))
+        print(f"  #{p['id']} {p['slot_date']} {p['brand']}/{p['stream']}/{p['slot']} {p['source_name']} "
+              f"[{p['status']}] {ds}")
+    now = datetime.now(tz)
+    for acct in app.settings.buffer_accounts:
+        print(f"buffer {acct}: {state.buffer_requests_since(acct, now - timedelta(days=1))} requests in 24h")
+    state.close()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="autopost")
+    parser.add_argument("--config", default=str(ROOT / "config"))
+    parser.add_argument("--state", default=str(ROOT / "state" / "state.db"))
+    parser.add_argument("-v", "--verbose", action="store_true")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("validate", help="check config (and optionally secrets / Telegram)")
+    p.add_argument("--check-secrets", action="store_true")
+    p.add_argument("--ping-telegram", action="store_true")
+    p.add_argument("--strict", action="store_true", help="exit 1 on placeholders / missing secrets")
+
+    p = sub.add_parser("plan", help="preview slot targets (not stored)")
+    p.add_argument("--date")
+    p.add_argument("--days", type=int, default=3)
+    p.add_argument("--brand")
+    p.add_argument("--seed", type=int)
+
+    p = sub.add_parser("run", help="publish due slots")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--brand")
+    p.add_argument("--now", help="dry-run only: pretend it is this local time (YYYY-MM-DDTHH:MM)")
+    p.add_argument("--real-sleep", action="store_true", help="dry-run only: really wait instead of simulating")
+    p.add_argument("--max-runtime-minutes", type=int, default=120)
+
+    sub.add_parser("status", help="show state")
+
+    args = parser.parse_args(argv)
+    setup_logging(args.verbose)
+    try:
+        app = load_config(args.config)
+    except ConfigError as exc:
+        print(f"CONFIG ERROR\n{exc}", file=sys.stderr)
+        return 1
+    use_clock_for_logs(app.settings.tz)
+    try:
+        return {"validate": cmd_validate, "plan": cmd_plan, "run": cmd_run, "status": cmd_status}[args.command](
+            args, app)
+    except MissingSecret as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

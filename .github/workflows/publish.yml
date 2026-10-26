@@ -1,0 +1,79 @@
+name: autopost
+
+on:
+  schedule:
+    # Every 30 minutes at off-peak minutes. Does nothing until cron_enabled: true in config/settings.yaml.
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: publish nothing, write nothing"
+        type: boolean
+        default: true
+      command:
+        description: "What to run"
+        type: choice
+        options: [run, validate, plan, status]
+        default: run
+      brand:
+        description: "Only this brand id (empty = all)"
+        type: string
+        default: ""
+      now:
+        description: "Dry run only: pretend it is this local time, e.g. 2026-10-27T17:37"
+        type: string
+        default: ""
+
+permissions:
+  contents: write   # commit state/state.db and manage the media-temp release
+
+concurrency:
+  group: autopost
+  cancel-in-progress: false
+
+jobs:
+  autopost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      PYTHONPATH: src
+      PYTHONUNBUFFERED: "1"
+      # All repository secrets as one JSON object; config refers to secrets by name,
+      # so adding a brand never requires editing this workflow.
+      SECRETS_JSON: ${{ toJSON(secrets) }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      COMMAND: ${{ github.event_name == 'workflow_dispatch' && inputs.command || 'run' }}
+      BRAND: ${{ github.event_name == 'workflow_dispatch' && inputs.brand || '' }}
+      NOW: ${{ github.event_name == 'workflow_dispatch' && inputs.now || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run
+        env:
+          AUTOPOST_COMMIT_STATE: ${{ (github.event_name != 'workflow_dispatch' || !inputs.dry_run) && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          args=()
+          case "$COMMAND" in
+            run)
+              [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+              [ -n "$BRAND" ] && args+=(--brand "$BRAND")
+              [ -n "$NOW" ] && args+=(--now "$NOW")
+              ;;
+            validate) args+=(--check-secrets) ;;
+            plan) [ -n "$BRAND" ] && args+=(--brand "$BRAND") ;;
+          esac
+          python -m autopost "$COMMAND" "${args[@]}"
+
+      - name: Commit state
+        if: always() && env.COMMAND == 'run' && env.DRY_RUN != 'true'
+        run: bash scripts/commit_state.sh "run ${{ github.run_id }}"

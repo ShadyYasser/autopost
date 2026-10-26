@@ -1,0 +1,79 @@
+id: takwin
+name: تكوين
+enabled: true
+
+# Slot types: fixed | prayer_relative | random_window | pick_window
+slots:
+  fajr:
+    type: prayer_relative
+    prayer: fajr
+    offset_minutes: -15
+    jitter_minutes: 5
+    hard_deadline: true        # every platform must be published before Fajr
+    gap_seconds: [30, 120]
+  maghrib:
+    type: prayer_relative
+    prayer: maghrib
+    offset_minutes: -15
+    jitter_minutes: 5
+    hard_deadline: true
+    gap_seconds: [30, 120]
+  third:
+    type: pick_window
+    windows:
+      - label: day
+        start: { time: "12:00" }
+        end: { time: "16:00" }
+      - label: night           # crosses midnight; belongs to the day it starts
+        start: { prayer: maghrib, offset_minutes: 180 }
+        end: { prayer: fajr, offset_minutes: -180, day_offset: 1 }
+
+text_source:
+  type: sheet
+  sheet_id: "REPLACE_WITH_SHEET_ID"
+  worksheet: null              # null = first worksheet
+  header_rows: 1
+  columns: { caption: A, title: B }
+  posted_at_column: C
+
+streams:
+  main:
+    drive_folder_id: "REPLACE_WITH_DRIVE_FOLDER_ID"
+    slots: [fajr, maghrib, third]
+    platforms: [facebook, instagram, tiktok, youtube, pinterest]
+
+# Variables: {caption} {title}. Platform length limits are applied automatically.
+templates:
+  facebook:  { text: "{caption}" }
+  instagram: { text: "{caption}" }
+  tiktok:    { text: "{caption}" }
+  youtube:   { title: "{title}", description: "{caption}" }
+  pinterest: { title: "{title}", description: "{caption}" }
+
+platforms:
+  facebook:
+    provider: direct
+    page_id: "771477079389943"
+    token_secret: META_PAGE_TOKEN_TAKWIN
+    format: reel
+  instagram:
+    provider: direct
+    ig_user_id: "17841455147710531"
+    token_secret: META_PAGE_TOKEN_TAKWIN
+  tiktok:
+    provider: buffer
+    buffer_account: tiktok_acct
+    channel: "_takwen"
+  youtube:
+    provider: buffer
+    buffer_account: youtube_acct
+    channel: "REPLACE_WITH_BUFFER_YOUTUBE_CHANNEL_NAME"
+    shorts_check: { vertical: true, max_seconds: 180 }
+    fallback: direct           # direct = manual Telegram hand-off while youtube_direct.enabled is false
+    privacy: private
+    category_id: "27"
+    refresh_token_secret: YOUTUBE_REFRESH_TOKEN_TAKWIN
+  pinterest:
+    provider: direct
+    board_id: "REPLACE_WITH_PINTEREST_BOARD_ID"
+    refresh_token_secret: PINTEREST_REFRESH_TOKEN_TAKWIN

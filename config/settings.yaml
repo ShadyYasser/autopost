@@ -1,0 +1,66 @@
+# Global settings. Secrets are referenced by NAME only (the value lives in GitHub Secrets).
+
+timezone: Africa/Cairo
+
+# Master switch for scheduled (cron) runs. Manual runs (workflow_dispatch) always work.
+# Keep false until the dry run and the one-real-post-per-platform tests pass.
+cron_enabled: false
+
+# Default location for prayer-relative slots (a brand can override with its own `prayer_times:`).
+prayer_times:
+  method: EGYPTIAN            # Egyptian General Authority of Survey (Fajr 19.5°, Isha 17.5°)
+  latitude: 31.4165           # Damietta
+  longitude: 31.8133
+  adjustments_minutes: { fajr: 0, sunrise: 0, dhuhr: 0, asr: 0, maghrib: 0, isha: 0 }
+
+scheduler:
+  # A run handles every slot whose target is within this many minutes, sleeping until each target.
+  # Keep it larger than the cron interval (30 min) so no slot falls between two runs.
+  lookahead_minutes: 40
+  # Default random gap between two platforms of the same post (slots can override with gap_seconds).
+  platform_gap_seconds: [120, 600]
+  # A slot without a hard deadline is skipped (and reported) if no run reached it within this time.
+  max_lateness_minutes: 180
+  # Never start a platform when less than this many seconds remain before a hard deadline.
+  deadline_margin_seconds: 180
+  # Daily targets of one brand are re-rolled until they are at least this far apart.
+  min_slot_spacing_minutes: 60
+
+max_attempts_per_delivery: 3
+low_content_warning_days: 3
+daily_summary_time: "23:30"
+
+google:
+  service_account_secret: GOOGLE_SERVICE_ACCOUNT_JSON
+
+telegram:
+  bot_token_secret: TELEGRAM_BOT_TOKEN
+  chat_id_secret: TELEGRAM_CHAT_ID
+
+media_hosting:
+  github_release_tag: media-temp
+
+buffer_accounts:
+  tiktok_acct:
+    api_key_secret: BUFFER_API_KEY
+    limits: { per_15min: 100, per_day: 100, per_30days: 3000, max_queued: 10, safety_margin: 10 }
+    poll: { interval_seconds: 30, timeout_minutes: 20 }
+  youtube_acct:
+    api_key_secret: BUFFER_YOUTUBE_API_KEY
+    limits: { per_15min: 100, per_day: 100, per_30days: 3000, max_queued: 10, safety_margin: 10 }
+    poll: { interval_seconds: 30, timeout_minutes: 20 }
+
+meta:
+  graph_version: v26.0
+
+pinterest:
+  environment: sandbox        # sandbox | production
+  app_id_secret: PINTEREST_APP_ID
+  app_secret_secret: PINTEREST_APP_SECRET
+
+youtube_direct:
+  # false → "direct" YouTube uploads are handed to you on Telegram (Drive link + title + description)
+  # true  → real Data API v3 resumable upload as PRIVATE (enable once the API audit is approved)
+  enabled: false
+  client_id_secret: YOUTUBE_CLIENT_ID
+  client_secret_secret: YOUTUBE_CLIENT_SECRET

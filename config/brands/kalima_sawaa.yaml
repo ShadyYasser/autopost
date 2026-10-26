@@ -1,0 +1,65 @@
+id: kalima_sawaa
+name: كلمة سواء
+enabled: true
+
+slots:
+  morning: { type: fixed, at: "11:00", jitter_minutes: 60 }
+  afternoon: { type: fixed, at: "16:00", jitter_minutes: 60 }
+  night: { type: fixed, at: "21:30", jitter_minutes: 60 }
+
+text_source:
+  type: filename               # {title} = file name without extension
+
+drive_parent_folder_id: "REPLACE_WITH_PARENT_FOLDER_ID"
+
+streams:
+  short:
+    subfolder: short
+    slots: [morning, afternoon, night]
+    platforms: [facebook, instagram, tiktok, youtube, pinterest]
+  long:
+    subfolder: long
+    slots: [night]             # night slot posts BOTH a short and a long video
+    platforms: [youtube, facebook]
+    overrides:
+      youtube:
+        provider: direct       # manual Telegram hand-off while youtube_direct.enabled is false
+        shorts_check: null
+        fallback: null
+      facebook:
+        format: video
+
+templates:
+  facebook:  { text: "{title}" }
+  instagram: { text: "{title}" }
+  tiktok:    { text: "{title}" }
+  youtube:   { title: "{title}", description: "{title}" }
+  pinterest: { title: "{title}", description: "{title}" }
+
+platforms:
+  facebook:
+    provider: direct
+    page_id: "1177142762151237"
+    token_secret: META_PAGE_TOKEN_KALIMA
+    format: reel
+  instagram:
+    provider: direct
+    ig_user_id: "17841411727741746"
+    token_secret: META_PAGE_TOKEN_KALIMA
+  tiktok:
+    provider: buffer
+    buffer_account: tiktok_acct
+    channel: "kalima_sawaa"
+  youtube:
+    provider: buffer
+    buffer_account: youtube_acct
+    channel: "REPLACE_WITH_BUFFER_YOUTUBE_CHANNEL_NAME"
+    shorts_check: { vertical: true, max_seconds: 180 }
+    fallback: direct
+    privacy: private
+    category_id: "27"
+    refresh_token_secret: YOUTUBE_REFRESH_TOKEN_KALIMA
+  pinterest:
+    provider: direct
+    board_id: "REPLACE_WITH_PINTEREST_BOARD_ID"
+    refresh_token_secret: PINTEREST_REFRESH_TOKEN_KALIMA
