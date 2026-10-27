@@ -86,11 +86,17 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          if { [ "$COMMAND" = "run" ] || [ "$COMMAND" = "test-post" ]; } && ! command -v ffprobe >/dev/null; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg >/dev/null
-          fi
+        run: pip install -r requirements.txt
+
+      # ffmpeg is installed by the bot itself, only when a post is due (from these cached Ubuntu
+      # packages when possible, else apt). The key follows the runner image, so a new image gets a
+      # fresh package set.
+      - name: Cache ffmpeg packages
+        if: env.COMMAND == 'run' || env.COMMAND == 'test-post'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ffmpeg-debs
+          key: ffmpeg-debs-${{ runner.os }}-${{ env.ImageOS }}-${{ env.ImageVersion }}
 
       - name: Run
         env:

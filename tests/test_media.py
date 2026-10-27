@@ -82,3 +82,76 @@ def test_transcode_reasons():
     assert transcode_reasons(ok, EncodeSettings()) == []
     bad = MediaInfo(240, 426, 20, container="matroska,webm", vcodec="av1", pix_fmt="yuv420p", acodec="opus")
     assert len(transcode_reasons(bad, EncodeSettings())) == 4
+
+
+class FakeRun:
+    def __init__(self, results, installs_on=None):
+        self.calls = []
+        self.results = list(results)
+        self.installs_on = installs_on
+
+    def __call__(self, args, **kw):
+        self.calls.append(args)
+        rc = self.results.pop(0) if self.results else 0
+        return subprocess.CompletedProcess(args, rc, stdout="", stderr="boom" if rc else "")
+
+
+def _patch(monkeypatch, which, run, clock):
+    import autopost.media as m
+
+    monkeypatch.setattr(m.shutil, "which", which)
+    monkeypatch.setattr(m.subprocess, "run", run)
+    monkeypatch.setattr(m.time, "monotonic", clock)
+
+
+def test_ensure_ffmpeg_already_present(monkeypatch):
+    from autopost.media import ensure_ffmpeg
+
+    run = FakeRun([])
+    _patch(monkeypatch, lambda name: f"/usr/bin/{name}", run, lambda: 0)
+    assert ensure_ffmpeg() == "present" and run.calls == []
+
+
+def test_ensure_ffmpeg_from_cached_debs(monkeypatch, tmp_path):
+    from autopost.media import ensure_ffmpeg
+
+    (tmp_path / "ffmpeg_6.1.deb").write_bytes(b"x")
+    state = {"installed": False}
+    run = FakeRun([0])
+
+    def which(name):
+        if name in ("ffmpeg", "ffprobe"):
+            return "/usr/bin/ffmpeg" if state["installed"] else None
+        return f"/usr/bin/{name}"
+
+    def run_and_install(args, **kw):
+        state["installed"] = True
+        return run(args, **kw)
+
+    _patch(monkeypatch, which, run_and_install, iter([0, 5]).__next__)
+    assert ensure_ffmpeg(tmp_path) == "cache"
+    assert run.calls[0][:3] == ["sudo", "-n", "dpkg"]
+
+
+def test_ensure_ffmpeg_falls_back_to_apt_and_alerts_when_slow(monkeypatch, tmp_path):
+    from autopost.media import ensure_ffmpeg
+
+    state = {"installed": False}
+    run = FakeRun([0, 0, 0])
+    alerts = []
+
+    def which(name):
+        if name in ("ffmpeg", "ffprobe"):
+            return "/usr/bin/ffmpeg" if state["installed"] else None
+        return f"/usr/bin/{name}"
+
+    def fake_run(args, **kw):
+        if "install" in args:
+            state["installed"] = True
+        return run(args, **kw)
+
+    _patch(monkeypatch, which, fake_run, iter([0, 200]).__next__)
+    assert ensure_ffmpeg(tmp_path / "cache", alert=alerts.append) == "apt"
+    install = next(c for c in run.calls if "install" in c)
+    assert f"Dir::Cache::archives={tmp_path / 'cache'}" in install
+    assert alerts and "3.3 min" in alerts[0]

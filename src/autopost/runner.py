@@ -82,7 +82,7 @@ class Runner:
                  publishers: PublisherFactory, secrets: Secrets, rng: random.Random | None = None,
                  dry_run: bool = False, brand_filter: str | None = None,
                  checkpoint: Callable[[str], None] | None = None, max_runtime_minutes: int = 120,
-                 prefetch_media: bool = False):
+                 prefetch_media: bool = False, ensure_tools: Callable[[], None] | None = None):
         self.app = app
         self.settings = app.settings
         self.tz = app.settings.tz
@@ -97,6 +97,8 @@ class Runner:
         self._checkpoint = checkpoint
         self.max_runtime = timedelta(minutes=max_runtime_minutes)
         self.prefetch_media = prefetch_media
+        self._ensure_tools = ensure_tools
+        self._tools_ready = False
         self._prefetched: set[tuple] = set()
         self.report = RunReport()
         self.services = Services(app=app, state=state, notifier=notifier, secrets=secrets, content=content,
@@ -258,6 +260,23 @@ class Runner:
         self.checkpoint(f"start {brand.id} {slot.slot}")
         return chains
 
+    def publishable(self, slot: SlotRow, now: datetime) -> bool:
+        """Due slot that will really be published (not one about to be skipped as too late)."""
+        return self.too_late(self.app.brands[slot.brand], slot.slot, slot.target, slot.deadline, now) is None
+
+    def ensure_tools(self) -> None:
+        """Install ffmpeg once, as soon as there is work in this run (before any download/transcode)."""
+        if self._tools_ready or self._ensure_tools is None:
+            return
+        self._tools_ready = True
+        try:
+            self._ensure_tools()
+        except Exception as exc:  # noqa: BLE001 - the slot then fails at prepare time and is retried/reported
+            log.exception("ffmpeg setup failed")
+            self.notifier.alert(f"ffmpeg could not be installed: {exc}",
+                                key=f"ffmpeg-install:{self.local_today(self.clock.now())}", state=self.state,
+                                now=self.clock.now())
+
     def prefetch(self, slot: SlotRow) -> None:
         """While waiting for a slot, download (and transcode) its next video so the target is not delayed."""
         key = (slot.brand, slot.slot_date, slot.slot)
@@ -341,6 +360,8 @@ class Runner:
 
         known = {(s.brand, s.slot_date, s.slot) for s in pending}
         day = self.local_today(started)
+        if chains or checks or any(self.publishable(r, started) for r in pending):
+            self.ensure_tools()
         while True:
             now = self.clock.now()
             accepting = now - started < self.max_runtime
@@ -352,6 +373,8 @@ class Runner:
                     self.ensure_slots(now)
                 fresh = [r for r in self.due_slots(now) if (r.brand, r.slot_date, r.slot) not in known]
                 if fresh:
+                    if any(self.publishable(r, now) for r in fresh):
+                        self.ensure_tools()
                     known.update((r.brand, r.slot_date, r.slot) for r in fresh)
                     pending = deque(sorted([*pending, *fresh], key=lambda r: r.target))
                     log.info("also due now: %s", ", ".join(f"{r.brand}/{r.slot}@{self.fmt(r.target)}" for r in fresh))

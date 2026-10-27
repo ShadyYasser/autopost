@@ -22,6 +22,7 @@ from .content.drive_source import ContentError, DriveContent, choose_next_row
 from .content.google_api import GoogleClient, GoogleError, session_from_service_account
 from .content.text import render
 from .platforms.base import DryRunPublisher
+from .media import ensure_ffmpeg
 from .prayer import PrayerCalculator
 from .runner import Runner
 from .scheduler import ScheduleError, plan_brand_day
@@ -206,6 +207,7 @@ def cmd_run(args, app: AppConfig) -> int:
         checkpoint=commit_state if os.environ.get("AUTOPOST_COMMIT_STATE") == "1" else None,
         max_runtime_minutes=args.max_runtime_minutes,
         prefetch_media=not dry or args.download,
+        ensure_tools=(lambda: ensure_ffmpeg(alert=lambda text: notifier.alert(text))) if (not dry or args.download) else None,
     )
     try:
         report = runner.run()
@@ -459,6 +461,7 @@ def cmd_test_post(args, app: AppConfig) -> int:
         else:
             variables = content.pick_text(brand.id, stream, video).variables
         clock = RealClock(app.settings.tz)
+        ensure_ffmpeg(alert=lambda text: notifier.alert(text))
         services = Services(app=app, state=state, notifier=notifier, secrets=secrets, content=content,
                             now=clock.now, advance=clock.advance, dry_run=False)
         registry = PublisherRegistry(services)

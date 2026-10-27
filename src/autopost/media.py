@@ -264,3 +264,56 @@ def prepare_for_upload(src: Path, out_dir: Path, settings: EncodeSettings | None
     after = probe(out)
     log.info("transcoded in %.0fs: %s → %s", time.monotonic() - started, before.describe(), after.describe())
     return out, before, after
+
+
+# ---------------------------------------------------------------- installing ffmpeg on demand
+
+DEFAULT_DEB_CACHE = "~/.cache/ffmpeg-debs"   # restored/saved by actions/cache in the workflow
+
+
+def _sudo(args: list[str], timeout: int = 900) -> subprocess.CompletedProcess:
+    return subprocess.run(["sudo", "-n", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def ffmpeg_ready() -> bool:
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def ensure_ffmpeg(deb_cache: str | Path | None = None, alert=None, slow_seconds: int = 180) -> str:
+    """Make ffmpeg/ffprobe available. Returns how: "present", "cache" or "apt".
+
+    First the .deb files cached by the workflow are installed offline with dpkg; if that is not
+    possible, a normal apt install (Ubuntu's official mirrors) runs and refreshes the cache folder.
+    If it takes longer than `slow_seconds`, `alert(text)` is called.
+    """
+    import os
+
+    if ffmpeg_ready():
+        return "present"
+    if not (shutil.which("sudo") and shutil.which("apt-get")):
+        raise ProbeError("ffmpeg is missing and cannot be installed on this machine")
+    started = time.monotonic()
+    cache = Path(os.path.expanduser(str(deb_cache or os.environ.get("AUTOPOST_DEB_CACHE") or DEFAULT_DEB_CACHE)))
+    method = None
+    debs = sorted(cache.glob("*.deb")) if cache.is_dir() else []
+    if debs:
+        result = _sudo(["dpkg", "-i", *map(str, debs)])
+        if result.returncode == 0 and ffmpeg_ready():
+            method = "cache"
+        else:
+            log.warning("installing ffmpeg from %d cached package(s) failed: %s", len(debs),
+                        (result.stderr or result.stdout).strip()[-300:])
+    if method is None:
+        (cache / "partial").mkdir(parents=True, exist_ok=True)
+        _sudo(["apt-get", "update", "-qq"])
+        result = _sudo(["apt-get", "install", "-y", "-qq", "--no-install-recommends",
+                        "-o", f"Dir::Cache::archives={cache}", "ffmpeg"])
+        _sudo(["chown", "-R", f"{os.getuid()}:{os.getgid()}", str(cache)])   # so actions/cache can save it
+        if result.returncode != 0 or not ffmpeg_ready():
+            raise ProbeError(f"apt install of ffmpeg failed: {(result.stderr or result.stdout).strip()[-300:]}")
+        method = "apt"
+    elapsed = time.monotonic() - started
+    log.info("ffmpeg installed via %s in %.0fs", method, elapsed)
+    if elapsed > slow_seconds and alert is not None:
+        alert(f"Installing ffmpeg took {elapsed / 60:.1f} min (method: {'cached packages' if method == 'cache' else 'apt from the Ubuntu mirrors'}).")
+    return method

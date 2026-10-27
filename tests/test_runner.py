@@ -313,3 +313,21 @@ def test_early_test_deliveries_are_skipped_and_texts_reused(app, tmp_path):
     d = {x.platform: x for x in state.deliveries(post["id"])}
     assert d["facebook"].status == "sent" and d["facebook"].url == "https://fb/1"
     assert post["status"] == "done"
+
+
+def test_ffmpeg_installed_only_when_a_post_is_due(app, tmp_path):
+    state = prepare_slots(app, tmp_path, "kalima_sawaa")
+    s = slot(state, "kalima_sawaa", "morning")
+    calls = []
+    # nothing due: no install
+    runner, state, *_ = make(app, tmp_path, s.target - timedelta(hours=3), brand="kalima_sawaa", state=state)
+    runner._ensure_tools = lambda: calls.append("install")
+    runner.run()
+    assert calls == []
+    # slot within look-ahead: install before anything else, exactly once
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target - timedelta(minutes=10),
+                                                         brand="kalima_sawaa", state=state)
+    runner._ensure_tools = lambda: calls.append(("install", clock.now()))
+    runner.run()
+    assert len(calls) == 1 and calls[0][1] == s.target - timedelta(minutes=10)
+    assert pub.calls and pub.calls[0][4] >= calls[0][1]
