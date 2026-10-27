@@ -33,13 +33,20 @@ for attempt in 1 2 3 4 5; do
   if git push -q origin "HEAD:${BRANCH}"; then
     exit 0
   fi
-  echo "push rejected (attempt ${attempt}); rebuilding the state commit on top of origin/${BRANCH}" >&2
+  echo "push rejected (attempt ${attempt}); merging our state with origin/${BRANCH}" >&2
   sleep $((attempt * 2))
-  # Only this workflow writes the DB (concurrency group), so our copy is always the newest.
+  # Never overwrite: another run may have recorded posts too. Merge both copies by natural keys.
   cp "$DB" "$BACKUP"
   git fetch -q origin "$BRANCH"
+  THEIRS="${RUNNER_TEMP:-/tmp}/state.db.theirs"
+  rm -f "$THEIRS"
+  git show "origin/${BRANCH}:${DB}" > "$THEIRS" 2>/dev/null || rm -f "$THEIRS"
   git reset -q --hard "origin/${BRANCH}"
-  cp "$BACKUP" "$DB"
+  if [ -s "$THEIRS" ]; then
+    python -m autopost merge-state --theirs "$THEIRS" --ours "$BACKUP" --out "$DB"
+  else
+    cp "$BACKUP" "$DB"
+  fi
   commit || exit 0
 done
 

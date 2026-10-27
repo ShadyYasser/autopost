@@ -521,6 +521,15 @@ def cmd_meta_info(args, app: AppConfig) -> int:
     return 0
 
 
+def cmd_merge_state(args, app: AppConfig) -> int:
+    """Merge two state DBs (used by scripts/commit_state.sh on a push conflict)."""
+    from .state import merge_states
+
+    added = merge_states(args.theirs, args.ours, args.out)
+    print("merged state: " + (", ".join(f"{k}+{v}" for k, v in sorted(added.items())) or "no differences"))
+    return 0
+
+
 def cmd_status(args, app: AppConfig) -> int:
     state = State(args.state)
     tz = app.settings.tz
@@ -590,6 +599,11 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="show state")
 
+    p = sub.add_parser("merge-state", help="merge two state DBs (push-conflict resolution)")
+    p.add_argument("--theirs", required=True)
+    p.add_argument("--ours", required=True)
+    p.add_argument("--out", required=True)
+
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
     try:
@@ -600,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
     use_clock_for_logs(app.settings.tz)
     try:
         return {"validate": cmd_validate, "plan": cmd_plan, "run": cmd_run, "sources": cmd_sources,
-                "check": cmd_check, "test-post": cmd_test_post, "meta-info": cmd_meta_info, "status": cmd_status}[args.command](
+                "check": cmd_check, "test-post": cmd_test_post, "meta-info": cmd_meta_info, "merge-state": cmd_merge_state, "status": cmd_status}[args.command](
             args, app)
     except (MissingSecret, GoogleError) as exc:
         print(str(exc), file=sys.stderr)

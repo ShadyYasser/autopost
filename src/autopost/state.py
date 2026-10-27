@@ -348,3 +348,103 @@ class State:
 
     def kv_set(self, key: str, value: str) -> None:
         self._exec("INSERT OR REPLACE INTO kv VALUES (?,?)", (key, value))
+
+
+# ---------------------------------------------------------------- merging two copies of the state
+
+_STATUS_RANK = {"scheduled": 0, "pending": 0, "in_progress": 1, "checking": 1, "retrying": 1, "failed": 2,
+                "partial": 3, "done": 3, "skipped": 3, "sent": 3, "manual": 3, "gave_up": 3, "skipped_deadline": 3}
+
+
+def merge_states(theirs: str | Path, ours: str | Path, out: str | Path) -> dict[str, int]:
+    """Merge two state DBs (e.g. after a push conflict) without losing anything either one recorded.
+
+    Rows are matched by natural keys (not autoincrement ids). When both copies have a row, the one
+    that is further along (status) or more recently updated wins. Append-only tables are unioned.
+    """
+    import shutil
+
+    tmp = Path(out).with_suffix(".merge-tmp")
+    shutil.copy(theirs, tmp)
+    dst = sqlite3.connect(tmp)
+    dst.row_factory = sqlite3.Row
+    dst.executescript(SCHEMA)
+    src = sqlite3.connect(ours)
+    src.row_factory = sqlite3.Row
+    added: dict[str, int] = {}
+
+    def newer(a: sqlite3.Row, b: sqlite3.Row, ts: str = "updated_utc") -> bool:
+        """Is row a (ours) better than row b (theirs)?"""
+        ra, rb = _STATUS_RANK.get(a["status"], 0), _STATUS_RANK.get(b["status"], 0)
+        return ra > rb or (ra == rb and (a[ts] or "") > (b[ts] or ""))
+
+    def bump(name: str) -> None:
+        added[name] = added.get(name, 0) + 1
+
+    # daily_slots: PK (brand, slot_date, slot)
+    for r in src.execute("SELECT * FROM daily_slots"):
+        cur = dst.execute("SELECT * FROM daily_slots WHERE brand=? AND slot_date=? AND slot=?",
+                          (r["brand"], r["slot_date"], r["slot"])).fetchone()
+        if cur is None or newer(r, cur):
+            dst.execute("INSERT OR REPLACE INTO daily_slots VALUES (?,?,?,?,?,?,?,?,?,?)", tuple(r))
+            bump("daily_slots")
+
+    # posts: natural key (brand, stream, slot_date, slot); deliveries follow their post
+    post_map: dict[int, int] = {}
+    cols = [c[1] for c in src.execute("PRAGMA table_info(posts)")][1:]
+    for r in src.execute("SELECT * FROM posts"):
+        cur = dst.execute("SELECT * FROM posts WHERE brand=? AND stream=? AND slot_date=? AND slot=?",
+                          (r["brand"], r["stream"], r["slot_date"], r["slot"])).fetchone()
+        if cur is None:
+            new_id = dst.execute(f"INSERT INTO posts ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                                 tuple(r[c] for c in cols)).lastrowid
+            post_map[r["id"]] = new_id
+            bump("posts")
+        else:
+            post_map[r["id"]] = cur["id"]
+            if newer(r, cur):
+                dst.execute("UPDATE posts SET status=?, updated_utc=? WHERE id=?",
+                            (r["status"], r["updated_utc"], cur["id"]))
+    dcols = [c[1] for c in src.execute("PRAGMA table_info(deliveries)")][1:]
+    for r in src.execute("SELECT * FROM deliveries"):
+        pid = post_map.get(r["post_id"])
+        if pid is None:
+            continue
+        cur = dst.execute("SELECT * FROM deliveries WHERE post_id=? AND platform=?", (pid, r["platform"])).fetchone()
+        values = [pid if c == "post_id" else r[c] for c in dcols]
+        if cur is None:
+            dst.execute(f"INSERT INTO deliveries ({','.join(dcols)}) VALUES ({','.join('?' * len(dcols))})", values)
+            bump("deliveries")
+        elif newer(r, cur):
+            sets = ",".join(f"{c}=?" for c in dcols if c != "post_id")
+            dst.execute(f"UPDATE deliveries SET {sets} WHERE id=?",
+                        [r[c] for c in dcols if c != "post_id"] + [cur["id"]])
+            bump("deliveries")
+
+    # early deliveries, alerts, kv: keyed tables (ours fills gaps; kv takes ours)
+    for r in src.execute("SELECT * FROM early_deliveries"):
+        if dst.execute("INSERT OR IGNORE INTO early_deliveries VALUES (?,?,?,?,?,?,?,?,?,?)", tuple(r)).rowcount:
+            bump("early_deliveries")
+    for r in src.execute("SELECT * FROM alerts_sent"):
+        if dst.execute("INSERT OR IGNORE INTO alerts_sent VALUES (?,?)", tuple(r)).rowcount:
+            bump("alerts_sent")
+    for r in src.execute("SELECT * FROM kv"):
+        dst.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", tuple(r))
+    for r in src.execute("SELECT * FROM caption_cursor"):
+        cur = dst.execute("SELECT * FROM caption_cursor WHERE brand=?", (r["brand"],)).fetchone()
+        if cur is None or r["updated_utc"] > cur["updated_utc"]:
+            dst.execute("INSERT OR REPLACE INTO caption_cursor VALUES (?,?,?)", tuple(r))
+
+    # buffer_requests: multiset union on (account, ts_utc) so no request is counted twice or lost
+    ours_counts = src.execute("SELECT account, ts_utc, COUNT(*) FROM buffer_requests GROUP BY account, ts_utc")
+    for account, ts, n in ours_counts.fetchall():
+        have = dst.execute("SELECT COUNT(*) FROM buffer_requests WHERE account=? AND ts_utc=?", (account, ts)).fetchone()[0]
+        for _ in range(n - have):
+            dst.execute("INSERT INTO buffer_requests (account, ts_utc) VALUES (?,?)", (account, ts))
+            bump("buffer_requests")
+
+    dst.commit()
+    dst.close()
+    src.close()
+    Path(tmp).replace(out)
+    return added
