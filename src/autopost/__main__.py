@@ -432,6 +432,25 @@ def cmd_test_post(args, app: AppConfig) -> int:
         state.close()
 
 
+def cmd_meta_info(args, app: AppConfig) -> int:
+    """Read-only: show what Facebook/Instagram report for a published video or media id."""
+    from .platforms.meta import GraphClient, GraphError
+
+    brand = app.brands[args.brand]
+    platform = "facebook" if args.platform == "facebook" else "instagram"
+    cfg = brand.platforms[platform]
+    g = GraphClient(Secrets().get(cfg.token_secret), app.settings.meta.graph_version)
+    fields = ("id,length,permalink_url,published,status,title,description,created_time" if platform == "facebook"
+              else "id,media_type,media_product_type,permalink,is_comment_enabled,comments_count,timestamp")
+    try:
+        data = g.call("GET", args.id, params={"fields": fields})
+    except GraphError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_status(args, app: AppConfig) -> int:
     state = State(args.state)
     tz = app.settings.tz
@@ -490,6 +509,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--video", help="'last' (last unposted in the folder order), a file name or a Drive id "
                                    "(default: the next unposted video)")
 
+    p = sub.add_parser("meta-info", help="read-only: what Facebook/Instagram report for a published id")
+    p.add_argument("--brand", required=True)
+    p.add_argument("--platform", required=True, choices=["facebook", "instagram"])
+    p.add_argument("--id", required=True)
+
     p = sub.add_parser("sources", help="read-only preview of Drive videos and sheet texts")
     p.add_argument("--brand")
     p.add_argument("--count", type=int, default=3, help="videos to preview per stream")
@@ -506,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
     use_clock_for_logs(app.settings.tz)
     try:
         return {"validate": cmd_validate, "plan": cmd_plan, "run": cmd_run, "sources": cmd_sources,
-                "check": cmd_check, "test-post": cmd_test_post, "status": cmd_status}[args.command](
+                "check": cmd_check, "test-post": cmd_test_post, "meta-info": cmd_meta_info, "status": cmd_status}[args.command](
             args, app)
     except (MissingSecret, GoogleError) as exc:
         print(str(exc), file=sys.stderr)

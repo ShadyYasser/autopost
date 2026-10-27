@@ -1,6 +1,9 @@
 id: kalima_sawaa
 name: كلمة سواء
 enabled: true
+# Comments off: applied automatically on Instagram. Facebook and TikTok have no API for it
+# (see docs/comments.md); YouTube is set in YouTube Studio.
+comments: off
 
 slots:
   morning: { type: fixed, at: "11:00", jitter_minutes: 60 }

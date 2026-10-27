@@ -60,6 +60,7 @@ media:
   preset: veryfast
   audio_bitrate: 128k
   transcode_timeout_minutes: 60
+  max_fps: 30                 # output is constant frame rate: the source rate, capped at this
 
 pinterest:
   environment: sandbox        # sandbox | production

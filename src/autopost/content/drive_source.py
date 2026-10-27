@@ -133,8 +133,9 @@ class DriveContent:
         self._tabs: dict[str, str] = {}
         self.notify = notify or (lambda text, key: log.warning("%s", text))
         m = app.settings.media
-        self.encode = EncodeSettings(m.min_short_side, m.crf, m.preset, m.audio_bitrate,
-                                     m.transcode_timeout_minutes * 60)
+        self.encode = EncodeSettings(min_short_side=m.min_short_side, crf=m.crf, preset=m.preset,
+                                     audio_bitrate=m.audio_bitrate, timeout_seconds=m.transcode_timeout_minutes * 60,
+                                     max_fps=m.max_fps)
         # video id -> (prepared path, its media info, files to delete on release)
         self._prepared: dict[str, tuple[Path, MediaInfo, list[Path]]] = {}
 

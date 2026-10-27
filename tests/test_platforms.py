@@ -246,9 +246,52 @@ def test_instagram_rupload_error_but_container_processing_keeps_polling(app, vid
         ("GET", "/C2", Resp(200, {"status_code": "FINISHED"})),
         ("POST", "17841411727741746/media_publish", Resp(200, {"id": "M2"})),
         ("GET", "/M2", Resp(200, {"permalink": "https://www.instagram.com/reel/xyz/"})),
+        ("POST", "/M2", Resp(200, {"success": True})),           # comments off (Kalima)
     ])
     pub = InstagramPublisher(services)
     pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
     out = pub.publish(ctx)
     assert out.status == "checking" and out.external_id == "C2"
     assert pub.check(ctx, delivery("C2")).url == "https://www.instagram.com/reel/xyz/"
+
+
+def test_instagram_turns_comments_off_for_kalima(app, video_file):
+    notifier = Notifier(None, None, dry_run=True)
+    services, ctx = make_ctx(app, "kalima_sawaa", "short", "instagram", video_file, {"text": "x"}, notifier=notifier)
+    s = Session([
+        ("GET", "/C3", Resp(200, {"status_code": "FINISHED"})),
+        ("POST", "17841411727741746/media_publish", Resp(200, {"id": "M3"})),
+        ("GET", "/M3", Resp(200, {"permalink": "https://www.instagram.com/reel/k/"})),
+        ("POST", "/M3", Resp(200, {"success": True})),
+    ])
+    pub = InstagramPublisher(services)
+    pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
+    assert pub.check(ctx, delivery("C3")).status == "sent"
+    assert s.calls[-1][2]["data"] == {"comment_enabled": "false"}
+    assert notifier.sent == []
+
+
+def test_instagram_comment_permission_missing_alerts_but_keeps_post(app, video_file):
+    notifier = Notifier(None, None, dry_run=True)
+    services, ctx = make_ctx(app, "kalima_sawaa", "short", "instagram", video_file, {"text": "x"}, notifier=notifier)
+    s = Session([
+        ("GET", "/C4", Resp(200, {"status_code": "FINISHED"})),
+        ("POST", "media_publish", Resp(200, {"id": "M4"})),
+        ("GET", "/M4", Resp(200, {"permalink": "https://www.instagram.com/reel/m/"})),
+        ("POST", "/M4", Resp(403, {"error": {"message": "(#10) Application does not have permission", "code": 10}})),
+    ])
+    pub = InstagramPublisher(services)
+    pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
+    out = pub.check(ctx, delivery("C4"))
+    assert out.status == "sent"
+    assert "instagram_manage_comments" in notifier.sent[-1]
+
+
+def test_takwin_comments_stay_on(app, video_file):
+    services, ctx = make_ctx(app, "takwin", "main", "instagram", video_file, {"text": "x"})
+    s = Session([("GET", "/C5", Resp(200, {"status_code": "FINISHED"})),
+                 ("POST", "media_publish", Resp(200, {"id": "M5"})),
+                 ("GET", "/M5", Resp(200, {"permalink": "p"}))])
+    pub = InstagramPublisher(services)
+    pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
+    assert pub.check(ctx, delivery("C5")).status == "sent" and len(s.calls) == 3

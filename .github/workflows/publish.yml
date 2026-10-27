@@ -13,7 +13,7 @@ on:
       command:
         description: "What to run"
         type: choice
-        options: [run, test-post, check, sources, validate, plan, status]
+        options: [run, test-post, check, meta-info, sources, validate, plan, status]
         default: run
       brand:
         description: "Only this brand id (empty = all)"
@@ -36,7 +36,7 @@ on:
         type: string
         default: ""
       video:
-        description: "test-post only (optional): last | file name | Drive id (default: next unposted)"
+        description: "test-post: last | file name | Drive id (default: next unposted). meta-info: the post id"
         type: string
         default: ""
       trigger:
@@ -109,6 +109,7 @@ jobs:
               [ -n "$VIDEO" ] && args+=(--video "$VIDEO")
               ;;
             check) args+=(--ping-telegram) ;;
+            meta-info) args+=(--brand "$BRAND" --platform "$PLATFORM" --id "$VIDEO") ;;
             sources) [ -n "$BRAND" ] && args+=(--brand "$BRAND") ;;
             validate) args+=(--check-secrets) ;;
             plan) [ -n "$BRAND" ] && args+=(--brand "$BRAND") ;;

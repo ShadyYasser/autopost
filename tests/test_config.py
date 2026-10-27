@@ -67,3 +67,9 @@ def test_new_brand_is_a_file(tmp_path):
     new["id"], new["name"] = "new_brand", "جديد"
     (cfg / "brands" / "new_brand.yaml").write_text(yaml.safe_dump(new, allow_unicode=True), encoding="utf-8")
     assert "new_brand" in load_config(cfg).brands
+
+
+def test_comments_option_accepts_yaml_off(app, tmp_path):
+    assert app.brands["kalima_sawaa"].comments == "off" and app.brands["takwin"].comments == "on"
+    cfg = make_config(tmp_path, lambda d: d.update(comments=False))
+    assert load_config(cfg).brands["takwin"].comments == "off"

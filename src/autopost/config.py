@@ -156,6 +156,7 @@ class MediaConfig(_Model):
     preset: str = "veryfast"
     audio_bitrate: str = "128k"
     transcode_timeout_minutes: int = Field(60, ge=1)
+    max_fps: int = Field(30, ge=1)
 
 
 class Settings(_Model):
@@ -399,6 +400,8 @@ class BrandConfig(_Model):
     id: str
     name: str
     enabled: bool = True
+    # off = turn comments off after publishing where the platform API allows it (Instagram)
+    comments: Literal["on", "off"] = "on"
     slots: dict[str, SlotConfig] = Field(min_length=1)
     prayer_times: PrayerTimesConfig | None = None
     min_slot_spacing_minutes: int | None = Field(None, ge=0)
@@ -406,6 +409,12 @@ class BrandConfig(_Model):
     streams: dict[str, StreamConfig] = Field(min_length=1)
     templates: dict[PlatformName, TemplateConfig]
     platforms: dict[PlatformName, PlatformConfig]
+
+    @field_validator("comments", mode="before")
+    @classmethod
+    def _comments(cls, v):
+        # YAML reads a bare on/off as true/false
+        return {True: "on", False: "off"}.get(v, v) if isinstance(v, bool) else v
 
     @field_validator("id")
     @classmethod

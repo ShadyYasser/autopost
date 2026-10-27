@@ -284,12 +284,28 @@ class InstagramPublisher(_MetaBase):
                 url = g.call("GET", media_id, params={"fields": "permalink"}).get("permalink")
             except GraphError:
                 pass
+            if ctx.brand.comments == "off":
+                self.disable_comments(ctx, g, str(media_id), url)
             return Outcome(status="sent", external_id=str(media_id), url=url)
         if code == "PUBLISHED":
             return Outcome(status="sent", external_id=cid)
         if self.timed_out(delivery.id):
             return Outcome(status="failed", external_id=cid, error=f"instagram still processing after {POLL_TIMEOUT}")
         return Outcome(status="checking", external_id=cid, check_after=self.later())
+
+    def disable_comments(self, ctx: PublishContext, g: GraphClient, media_id: str, url: str | None) -> bool:
+        """Turn comments off on a published IG media. A failure is reported but does not undo the post."""
+        try:
+            g.call("POST", media_id, data={"comment_enabled": "false"})
+            log.info("instagram: comments turned off on %s", media_id)
+            return True
+        except GraphError as exc:
+            hint = (" The Meta app/token probably lacks the instagram_manage_comments permission: add it and "
+                    "regenerate the Page token." if exc.code in (10, 200, 3) or (exc.code or 0) >= 200 else "")
+            self.services.notifier.alert(
+                f"{ctx.brand.name}: Instagram post published but comments could NOT be turned off: {exc}.{hint}\n"
+                f"{url or media_id}")
+            return False
 
     def cancel(self, ctx: PublishContext, delivery) -> None:
         log.info("instagram: container %s left unpublished (deadline)", delivery.external_id)
