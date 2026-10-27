@@ -1,5 +1,5 @@
 import random
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -116,7 +116,7 @@ def prepare_slots(app, tmp_path, brand):
 def test_prayer_slot_publishes_everything_before_deadline(app, tmp_path):
     state = prepare_slots(app, tmp_path, "takwin")
     s = slot(state, "takwin", "maghrib")
-    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target - timedelta(minutes=25),
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target - timedelta(minutes=10),
                                                          brand="takwin", state=state)
     runner.run()
     calls = [c for c in pub.calls if c[0] == "takwin"]
@@ -274,3 +274,42 @@ def test_sheet_write_failure_alerts_but_publishes(app, tmp_path):
     runner.run()
     assert len([c for c in pub.calls if c[0] == "takwin"]) >= 5
     assert any("sheet row 7" in m for m in notifier.sent)
+
+
+def test_busy_run_picks_up_a_prayer_slot_that_becomes_due(app, tmp_path):
+    """A long Kalima post must not make Takwin's Maghrib wait for the next run."""
+    runner, state, *_ = make(app, tmp_path, at(app, 0, 7))
+    runner.ensure_slots(at(app, 0, 7))
+    maghrib = slot(state, "takwin", "maghrib")
+    # pretend a Kalima slot is due 30 min before Maghrib (outside Maghrib's lookahead at run start)
+    state.db.execute("UPDATE daily_slots SET target_utc=?, status='scheduled' WHERE brand='kalima_sawaa' AND slot_date=? "
+                     "AND slot='afternoon'", ((maghrib.target - timedelta(minutes=30)).astimezone(timezone.utc)
+                                              .isoformat(timespec="seconds"), TZ_DAY.isoformat()))
+    start = maghrib.target - timedelta(minutes=30)
+    pub = FakePublisher(None, seconds=60)
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, start, state=state, pub=pub)
+    runner.run()
+    takwin = [c for c in pub.calls if c[0] == "takwin" and c[1] == "main"]
+    assert len(takwin) == 5 and takwin[0][4] >= maghrib.target
+    assert all(c[4] < maghrib.deadline for c in takwin)
+
+
+def test_early_test_deliveries_are_skipped_and_texts_reused(app, tmp_path):
+    state = prepare_slots(app, tmp_path, "kalima_sawaa")
+    s = slot(state, "kalima_sawaa", "morning")
+    content = FakeContent()
+    first = content._pool("kalima_sawaa", "short")[0]
+    state.record_early_delivery("kalima_sawaa", "short", first.id, "facebook", "direct", "sent", "FB1",
+                                "https://fb/1", {"title": "from the test"}, s.target - timedelta(days=2))
+    state.record_early_delivery("kalima_sawaa", "short", first.id, "instagram", "direct", "sent", "IG1",
+                                "https://ig/1", {"title": "from the test"}, s.target - timedelta(days=2))
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target, brand="kalima_sawaa",
+                                                         state=state, content=content)
+    runner.run()
+    platforms = sorted(c[2] for c in pub.calls)
+    assert platforms == ["pinterest", "tiktok", "youtube"]
+    assert all(c[5].get("title", c[5].get("text")) == "from the test" for c in pub.calls)
+    post = state.posts_for_slot("kalima_sawaa", TZ_DAY, "morning")[0]
+    d = {x.platform: x for x in state.deliveries(post["id"])}
+    assert d["facebook"].status == "sent" and d["facebook"].url == "https://fb/1"
+    assert post["status"] == "done"

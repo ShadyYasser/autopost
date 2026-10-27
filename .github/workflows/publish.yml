@@ -36,9 +36,13 @@ on:
         type: string
         default: ""
       video:
-        description: "test-post only (optional): file name or Drive id (default: next unposted)"
+        description: "test-post only (optional): last | file name | Drive id (default: next unposted)"
         type: string
         default: ""
+      trigger:
+        description: "manual, or cron for the external scheduler (cron runs obey cron_enabled)"
+        type: string
+        default: "manual"
 
 permissions:
   contents: write   # commit state/state.db and manage the media-temp release
@@ -66,8 +70,13 @@ jobs:
       PLATFORM: ${{ github.event_name == 'workflow_dispatch' && inputs.platform || '' }}
       STREAM: ${{ github.event_name == 'workflow_dispatch' && inputs.stream || '' }}
       VIDEO: ${{ github.event_name == 'workflow_dispatch' && inputs.video || '' }}
+      AUTOPOST_TRIGGER: ${{ github.event_name == 'schedule' && 'cron' || inputs.trigger || 'manual' }}
     steps:
+      # Check out the branch tip at job start (not the commit at trigger time): a run that waited in
+      # the concurrency queue must see the state committed by the run before it.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - uses: actions/setup-python@v5
         with:
@@ -83,7 +92,7 @@ jobs:
 
       - name: Run
         env:
-          AUTOPOST_COMMIT_STATE: ${{ (github.event_name != 'workflow_dispatch' || !inputs.dry_run) && '1' || '0' }}
+          AUTOPOST_COMMIT_STATE: ${{ (github.event_name != 'workflow_dispatch' || !inputs.dry_run) && inputs.command != 'test-post' && '1' || '0' }}
         run: |
           set -euo pipefail
           args=()
@@ -107,5 +116,5 @@ jobs:
           python -m autopost "$COMMAND" "${args[@]}"
 
       - name: Commit state
-        if: always() && env.COMMAND == 'run' && env.DRY_RUN != 'true'
+        if: always() && ((env.COMMAND == 'run' && env.DRY_RUN != 'true') || env.COMMAND == 'test-post')
         run: bash scripts/commit_state.sh "run ${{ github.run_id }}"

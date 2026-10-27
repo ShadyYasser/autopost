@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import random
@@ -172,7 +173,8 @@ def commit_state(reason: str) -> None:
 
 
 def cmd_run(args, app: AppConfig) -> int:
-    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and not app.settings.cron_enabled:
+    scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule" or os.environ.get("AUTOPOST_TRIGGER") == "cron"
+    if scheduled and not app.settings.cron_enabled:
         log.info("cron_enabled is false in config/settings.yaml: scheduled run does nothing")
         return 0
     dry = args.dry_run
@@ -339,7 +341,12 @@ def cmd_check(args, app: AppConfig) -> int:
 
 
 def cmd_test_post(args, app: AppConfig) -> int:
-    """Publish ONE real post to ONE platform now. Nothing is recorded in state or the sheet."""
+    """Publish one real post now, to one or more platforms, with the same video and texts.
+
+    Successful deliveries are recorded in state (early_deliveries): when the video's normal turn
+    comes, those platforms are skipped and only the missing ones are posted. Nothing is written
+    to the sheet and the video is not marked as used.
+    """
     import time as _time
 
     from .platforms.base import PublishContext, Services
@@ -350,65 +357,79 @@ def cmd_test_post(args, app: AppConfig) -> int:
     if brand is None:
         print(f"unknown brand {args.brand!r}", file=sys.stderr)
         return 2
-    stream = args.stream or next(s for s, cfg in brand.streams.items() if args.platform in cfg.platforms)
-    if args.platform not in brand.streams[stream].platforms:
-        print(f"{brand.id}/{stream} does not publish to {args.platform}", file=sys.stderr)
+    platforms = [p.strip() for p in args.platform.split(",") if p.strip()]
+    stream = args.stream or next((s for s, cfg in brand.streams.items() if platforms[0] in cfg.platforms), None)
+    if stream not in brand.streams:
+        print(f"unknown stream {stream!r} for {brand.id}", file=sys.stderr)
         return 2
-    cfg = brand.platform_for(stream, args.platform)
-    if not cfg.enabled:
-        log.warning("%s is disabled in config; testing it anyway", args.platform)
+    for platform in platforms:
+        if platform not in brand.streams[stream].platforms:
+            print(f"{brand.id}/{stream} does not publish to {platform}", file=sys.stderr)
+            return 2
     secrets = Secrets()
-    state, tmpdir = open_state(args.state, throwaway=True)
+    state = State(args.state)
     notifier = make_notifier(app, secrets, dry_run=False)
     content = make_content(app, state, secrets, dry_run=True)   # dry_run here = never write the sheet
     if not isinstance(content, DriveContent):
         print("Google credentials missing", file=sys.stderr)
         return 1
     try:
-        if args.video:
-            matches = [v for v in content.listing(brand.id, stream) if args.video in (v.id, v.name)]
-            if not matches:
-                print(f"no video named {args.video!r} in {brand.id}/{stream}", file=sys.stderr)
-                return 2
-            video = matches[0]
+        unused = content.unused(brand.id, stream)
+        if args.video == "last":
+            video = unused[-1] if unused else None
+        elif args.video:
+            video = next((v for v in content.listing(brand.id, stream) if args.video in (v.id, v.name)), None)
         else:
-            video = content.next_video(brand.id, stream)
-        text = content.pick_text(brand.id, stream, video)
-        texts = render(brand.templates[args.platform], args.platform, text.variables, app.settings.text_limits)
+            video = unused[0] if unused else None
+        if video is None:
+            print(f"no matching unposted video in {brand.id}/{stream}", file=sys.stderr)
+            return 2
+        if video.id in state.used_source_ids(brand.id, stream):
+            print(f"{video.name} was already posted by the schedule; pick another video", file=sys.stderr)
+            return 2
+        early = {r["platform"]: r for r in state.early_deliveries(brand.id, stream, video.id)}
+        if early:
+            variables = json.loads(next(iter(early.values()))["variables_json"])
+        else:
+            variables = content.pick_text(brand.id, stream, video).variables
         clock = RealClock(app.settings.tz)
         services = Services(app=app, state=state, notifier=notifier, secrets=secrets, content=content,
                             now=clock.now, advance=clock.advance, dry_run=False)
-        holder: dict = {}
-
-        def fetch():
-            if "path" not in holder:
-                holder["path"] = content.fetch(video)
-                video.local_path = holder["path"]
-            return holder["path"]
-
-        ctx = PublishContext(brand=brand, stream=stream, platform=args.platform, cfg=cfg, post_id=0, video=video,
-                             texts=texts, deadline=None, services=services, fetch_video=fetch,
-                             media_info=lambda: content.probe(video))
-        print(f"TEST POST {brand.id}/{stream} → {args.platform} via {cfg.provider}: {video.name}")
-        for k, v in texts.items():
-            print(f"  {k} [{len(v)}]: {v}")
-        publisher = PublisherRegistry(services)(args.platform, cfg.provider)
-        outcome = publisher.publish(ctx)
-        deadline = _time.monotonic() + 30 * 60
-        while outcome.status == "checking" and _time.monotonic() < deadline:
-            wait = max(5, (outcome.check_after - clock.now()).total_seconds()) if outcome.check_after else 15
-            log.info("waiting %.0fs for %s to finish processing…", wait, args.platform)
-            _time.sleep(wait)
-            outcome = publisher.check(ctx, DeliveryRow(0, 0, args.platform, cfg.provider, 0, "checking", 1,
-                                                       outcome.external_id, None, None, None))
-        result = f"{outcome.status}{(' ' + outcome.url) if outcome.url else ''}{(' — ' + outcome.error) if outcome.error else ''}"
-        print(f"RESULT: {result}")
-        notifier.send(f"🧪 Test post {brand.name} → {args.platform}: {result}\n{video.name}")
+        registry = PublisherRegistry(services)
+        print(f"TEST POST {brand.id}/{stream}: {video.name}")
+        results = []
+        for platform in platforms:
+            if platform in early:
+                print(f"- {platform}: already delivered earlier ({early[platform]['url'] or early[platform]['status']}); skipped")
+                continue
+            cfg = brand.platform_for(stream, platform)
+            texts = render(brand.templates[platform], platform, variables, app.settings.text_limits)
+            ctx = PublishContext(brand=brand, stream=stream, platform=platform, cfg=cfg, post_id=0, video=video,
+                                 texts=texts, deadline=None, services=services,
+                                 fetch_video=lambda: content.fetch(video), media_info=lambda: content.probe(video))
+            print(f"- {platform} via {cfg.provider}: " + " | ".join(f"{k}[{len(v)}]" for k, v in texts.items()))
+            publisher = registry(platform, cfg.provider)
+            outcome = publisher.publish(ctx)
+            give_up = _time.monotonic() + 30 * 60
+            while outcome.status == "checking" and _time.monotonic() < give_up:
+                wait = max(5, (outcome.check_after - clock.now()).total_seconds()) if outcome.check_after else 15
+                log.info("waiting %.0fs for %s to finish processing…", wait, platform)
+                _time.sleep(wait)
+                outcome = publisher.check(ctx, DeliveryRow(0, 0, platform, cfg.provider, 0, "checking", 1,
+                                                           outcome.external_id, None, None, None))
+            line = f"{platform}: {outcome.status}" + (f" {outcome.url}" if outcome.url else "") + (
+                f" — {outcome.error}" if outcome.error else "")
+            print(f"  RESULT {line}")
+            results.append(line)
+            if outcome.status in ("sent", "manual"):
+                state.record_early_delivery(brand.id, stream, video.id, platform, outcome.provider or cfg.provider,
+                                            outcome.status, outcome.external_id, outcome.url, variables, clock.now())
         content.release(video)
-        return 0 if outcome.status in ("sent", "manual") else 1
+        if results:
+            notifier.send(f"🧪 Test post — {brand.name}/{stream}\n{video.name}\n\n" + "\n".join(results))
+        return 0 if all(": sent" in r or ": manual" in r for r in results) else 1
     finally:
         state.close()
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def cmd_status(args, app: AppConfig) -> int:
@@ -464,9 +485,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("test-post", help="publish ONE real post to ONE platform now (not recorded)")
     p.add_argument("--brand", required=True)
-    p.add_argument("--platform", required=True, choices=["facebook", "instagram", "tiktok", "youtube", "pinterest"])
+    p.add_argument("--platform", required=True, help="one or more, comma separated: facebook,instagram")
     p.add_argument("--stream", help="default: the first stream of the brand that publishes to the platform")
-    p.add_argument("--video", help="file name or Drive id (default: the next unposted video)")
+    p.add_argument("--video", help="'last' (last unposted in the folder order), a file name or a Drive id "
+                                   "(default: the next unposted video)")
 
     p = sub.add_parser("sources", help="read-only preview of Drive videos and sheet texts")
     p.add_argument("--brand")

@@ -20,7 +20,7 @@ from typing import Callable
 
 from .alerts.telegram import Notifier
 from .config import AppConfig, BrandConfig
-from .content.base import ContentSource, VideoItem
+from .content.base import ContentSource, TextChoice, VideoItem
 from .content.text import render
 from .platforms.base import Outcome, Publisher, PublishContext, Services
 from .scheduler import ScheduleError, plan_brand_day
@@ -196,7 +196,12 @@ class Runner:
                         f"{brand.name}: no unposted videos left in stream '{stream}'. Slot {slot.slot} skipped for it.",
                         key=f"empty:{brand.id}:{stream}:{self.local_today(now)}", state=self.state, now=now)
                     continue
-                text = self.content.pick_text(brand.id, stream, video)
+                early = {r["platform"]: r for r in self.state.early_deliveries(brand.id, stream, video.id)}
+                if early:
+                    # Some platforms got this video in a test post: reuse its texts, consume no sheet row.
+                    text = TextChoice(json.loads(next(iter(early.values()))["variables_json"]))
+                else:
+                    text = self.content.pick_text(brand.id, stream, video)
             except Exception as exc:  # noqa: BLE001 - Drive/Sheets trouble must not crash the run
                 log.exception("%s/%s: content error", brand.id, stream)
                 errors.append(f"{stream}: {exc}")
@@ -214,11 +219,22 @@ class Runner:
             except Exception as exc:  # noqa: BLE001
                 log.exception("commit_text failed")
                 self.notifier.alert(f"{brand.name}: {exc}. Rotation continues from the position saved in state.")
-            log.info("  post #%s %s/%s: %s, order %s", post_id, brand.id, stream, video.name,
-                     " → ".join(p for p, _ in routing))
-            ids = deque(d.id for d in self.state.deliveries(post_id))
+            for d in self.state.deliveries(post_id):
+                pre = early.get(d.platform)
+                if pre is not None:
+                    self.state.update_delivery(d.id, now, status=pre["status"], external_id=pre["external_id"],
+                                               url=pre["url"], provider=pre["provider"],
+                                               error=f"delivered early (test post {pre['delivered_utc']})")
+            log.info("  post #%s %s/%s: %s, order %s%s", post_id, brand.id, stream, video.name,
+                     " → ".join(p for p, _ in routing),
+                     f" (already done: {', '.join(sorted(early))})" if early else "")
+            ids = deque(d.id for d in self.state.deliveries(post_id) if d.status not in FINAL_DELIVERY)
             ready = now if not chains else now + self.random_gap(gap)
-            chains.append(Chain(brand, stream, slot, post_id, video, text.variables, ids, ready, gap))
+            chain = Chain(brand, stream, slot, post_id, video, text.variables, ids, ready, gap)
+            if chain.finished:
+                self.finish_chain(chain)
+            else:
+                chains.append(chain)
             try:
                 self.warn_low_content(brand, stream, now)
             except Exception:  # noqa: BLE001
@@ -227,11 +243,11 @@ class Runner:
             self.notifier.alert(f"{label}: could not prepare content:\n" + "\n".join(errors)
                                 + ("\nThe slot will be retried on the next run." if not chains else ""),
                                 key=f"content-error:{brand.id}:{slot.slot_date}:{slot.slot}", state=self.state, now=now)
-        if not chains and errors:
+        if not chains and errors and not self.state.posts_for_slot(brand.id, slot.slot_date, slot.slot):
             # Nothing was used up: leave the slot for the next run (it is skipped there if too late).
             self.state.set_slot_status(brand.id, slot.slot_date, slot.slot, "scheduled", now)
             return []
-        if not chains:
+        if not chains and not self.state.posts_for_slot(brand.id, slot.slot_date, slot.slot):
             self.state.set_slot_status(brand.id, slot.slot_date, slot.slot, "skipped", now, note="no content")
             self.report.skipped.append(label)
         self.checkpoint(f"start {brand.id} {slot.slot}")
@@ -318,9 +334,22 @@ class Runner:
         else:
             log.info("no slot due within the next %d min", self.settings.scheduler.lookahead_minutes)
 
+        known = {(s.brand, s.slot_date, s.slot) for s in pending}
+        day = self.local_today(started)
         while True:
             now = self.clock.now()
             accepting = now - started < self.max_runtime
+            if accepting and (chains or checks or pending):
+                # While this run is busy, slots that become due are picked up here, not left waiting
+                # for the next run (which cannot start before this one ends).
+                if self.local_today(now) != day:
+                    day = self.local_today(now)
+                    self.ensure_slots(now)
+                fresh = [r for r in self.due_slots(now) if (r.brand, r.slot_date, r.slot) not in known]
+                if fresh:
+                    known.update((r.brand, r.slot_date, r.slot) for r in fresh)
+                    pending = deque(sorted([*pending, *fresh], key=lambda r: r.target))
+                    log.info("also due now: %s", ", ".join(f"{r.brand}/{r.slot}@{self.fmt(r.target)}" for r in fresh))
             while accepting and pending and pending[0].target <= now:
                 chains.extend(self.start_slot(pending.popleft(), now))
                 now = self.clock.now()

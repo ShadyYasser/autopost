@@ -87,6 +87,22 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 );
 
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+
+-- Deliveries made outside the schedule (test-post). When the video's normal turn comes,
+-- these platforms count as already done and the same texts are reused.
+CREATE TABLE IF NOT EXISTS early_deliveries (
+    brand TEXT NOT NULL,
+    stream TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL,             -- sent | manual
+    external_id TEXT,
+    url TEXT,
+    variables_json TEXT NOT NULL,
+    delivered_utc TEXT NOT NULL,
+    PRIMARY KEY (brand, stream, source_id, platform)
+);
 """
 
 FINAL_DELIVERY = {"sent", "manual", "gave_up", "skipped_deadline"}
@@ -270,6 +286,19 @@ class State:
             (status, attempts_inc, external_id, url, error, provider,
              to_utc_str(check_after) if check_after else None, to_utc_str(now), delivery_id),
         )
+
+    # ------------------------------------------------------------ early (test) deliveries
+
+    def record_early_delivery(self, brand: str, stream: str, source_id: str, platform: str, provider: str,
+                              status: str, external_id: str | None, url: str | None, variables: dict[str, str],
+                              now: datetime) -> None:
+        self._exec("INSERT OR REPLACE INTO early_deliveries VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (brand, stream, source_id, platform, provider, status, external_id, url,
+                    json.dumps(variables, ensure_ascii=False), to_utc_str(now)))
+
+    def early_deliveries(self, brand: str, stream: str, source_id: str) -> list[sqlite3.Row]:
+        return list(self._exec("SELECT * FROM early_deliveries WHERE brand=? AND stream=? AND source_id=? "
+                               "ORDER BY delivered_utc", (brand, stream, source_id)))
 
     # ------------------------------------------------------------ caption cursor
 

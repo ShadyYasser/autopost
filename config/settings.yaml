@@ -15,8 +15,8 @@ prayer_times:
 
 scheduler:
   # A run handles every slot whose target is within this many minutes, sleeping until each target.
-  # Keep it larger than the cron interval (30 min) so no slot falls between two runs.
-  lookahead_minutes: 40
+  # Keep it larger than the trigger interval (cron-job.org every 10 min) so no slot falls between runs.
+  lookahead_minutes: 15
   # Default random gap between two platforms of the same post (slots can override with gap_seconds).
   platform_gap_seconds: [120, 600]
   # A slot without a hard deadline is skipped (and reported) if no run reached it within this time.
