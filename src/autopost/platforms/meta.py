@@ -29,6 +29,7 @@ RUPLOAD_IG = "https://rupload.facebook.com/ig-api-upload/{version}/{container}"
 REEL_MAX_SECONDS = 90
 TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 368, 613, 9007}
 POLL_SECONDS = 15
+MAX_IN_MEMORY = 512 * 1024 * 1024
 POLL_TIMEOUT = timedelta(minutes=25)
 
 
@@ -84,10 +85,15 @@ class GraphClient:
     def rupload(self, url: str, path: Path, timeout: int = 1800) -> dict:
         size = path.stat().st_size
         headers = {**self.headers, "offset": "0", "file_size": str(size), "Content-Type": "application/octet-stream"}
+        # Send the whole file as one body with an exact Content-Length (no streaming/chunking surprises).
+        body = path.read_bytes() if size <= MAX_IN_MEMORY else None
         for attempt in range(1, self.attempts + 1):
             try:
-                with path.open("rb") as fh:
-                    resp = self.session.post(url, data=fh, headers=headers, timeout=timeout)
+                if body is not None:
+                    resp = self.session.post(url, data=body, headers=headers, timeout=timeout)
+                else:
+                    with path.open("rb") as fh:
+                        resp = self.session.post(url, data=fh, headers=headers, timeout=timeout)
             except requests.RequestException as exc:
                 if attempt == self.attempts:
                     raise GraphError(f"upload network error: {type(exc).__name__}", transient=True) from exc
@@ -232,9 +238,20 @@ class InstagramPublisher(_MetaBase):
                 "share_to_feed": "true"})
             cid = container["id"]
             uri = container.get("uri") or RUPLOAD_IG.format(version=g.version, container=cid)
-            g.rupload(uri, path)
         except (GraphError, KeyError) as exc:
             return self.failed(exc)
+        try:
+            g.rupload(uri, path)
+        except GraphError as exc:
+            # The rupload error is generic; the container status usually says what went wrong.
+            detail = ""
+            try:
+                st = g.call("GET", cid, params={"fields": "status_code,status"})
+                detail = f" | container {st.get('status_code')}: {st.get('status')}"
+            except GraphError:
+                pass
+            log.error("instagram upload failed for %s (%.1f MB)%s", path.name, path.stat().st_size / 1_048_576, detail)
+            return Outcome(status="failed", error=f"instagram upload: {exc}{detail}", retryable=True)
         log.info("instagram: uploaded to container %s; waiting for processing", cid)
         return Outcome(status="checking", external_id=str(cid), check_after=self.later(10))
 
