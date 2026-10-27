@@ -82,10 +82,12 @@ Common errors:
 
 ## 3. Why overlapping triggers are safe
 
-- **One run at a time.** The workflow's `concurrency: group: autopost`
-  (`cancel-in-progress: false`) lets one run execute while at most one more waits. If a
-  third trigger arrives, GitHub cancels the waiting one and keeps the newest. Nothing
-  runs twice in parallel.
+- **One publishing run at a time.** Everything that publishes or writes state (cron-job.org
+  and schedule runs, real `run`, `test-post`) shares the concurrency group `autopost-publish`
+  (`cancel-in-progress: false`). One run executes while at most one more waits. If a third
+  trigger arrives, GitHub cancels the waiting one and keeps the newest. Nothing publishes
+  twice in parallel. Read-only commands and dry runs have their own groups, so they never
+  wait behind publishing runs and are never dropped by them.
 - **The waiting run sees the latest state.** Each run checks out the branch tip when it
   starts (`ref: github.ref_name`), not the commit from when it was triggered. It
   therefore sees the `state/state.db` the previous run committed. State is also

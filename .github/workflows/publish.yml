@@ -47,8 +47,10 @@ on:
 permissions:
   contents: write   # commit state/state.db and manage the media-temp release
 
+# Runs that publish or write state share one queue (one at a time). Read-only commands and dry runs
+# get their own group so they never wait behind, or get dropped by, the publishing queue.
 concurrency:
-  group: autopost
+  group: ${{ (github.event_name != 'workflow_dispatch' || inputs.command == 'test-post' || (inputs.command == 'run' && !inputs.dry_run)) && 'autopost-publish' || format('autopost-readonly-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
