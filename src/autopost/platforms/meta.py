@@ -82,11 +82,25 @@ class GraphClient:
             raise err
         raise GraphError("unreachable")
 
-    def rupload(self, url: str, path: Path, timeout: int = 1800) -> dict:
+    def rupload_status(self, url: str) -> dict:
+        """What the upload server holds for this session (used to resume); {} if it does not say."""
+        try:
+            resp = self.session.get(url, headers=self.headers, timeout=60)
+            return resp.json() if resp.content else {}
+        except (requests.RequestException, ValueError):
+            return {}
+
+    def rupload(self, url: str, path: Path, timeout: int = 1800, offset: int = 0) -> dict:
         size = path.stat().st_size
-        headers = {**self.headers, "offset": "0", "file_size": str(size), "Content-Type": "application/octet-stream"}
-        # Send the whole file as one body with an exact Content-Length (no streaming/chunking surprises).
-        body = path.read_bytes() if size <= MAX_IN_MEMORY else None
+        headers = {**self.headers, "offset": str(offset), "file_size": str(size),
+                   "Content-Type": "application/octet-stream"}
+        # Send the (rest of the) file as one body with an exact Content-Length.
+        if size - offset <= MAX_IN_MEMORY:
+            with path.open("rb") as fh:
+                fh.seek(offset)
+                body = fh.read()
+        else:
+            body = None
         for attempt in range(1, self.attempts + 1):
             try:
                 if body is not None:
@@ -241,7 +255,7 @@ class InstagramPublisher(_MetaBase):
         except (GraphError, KeyError) as exc:
             return self.failed(exc)
         try:
-            g.rupload(uri, path)
+            self._upload_with_resume(g, uri, path)
         except GraphError as exc:
             # rupload can answer "ProcessingFailedError" while Instagram is in fact still processing the
             # file it received (seen with longer videos). The container status is the source of truth.
@@ -260,6 +274,24 @@ class InstagramPublisher(_MetaBase):
             return Outcome(status="failed", error=f"instagram upload: {exc}{detail}", retryable=True)
         log.info("instagram: uploaded to container %s; waiting for processing", cid)
         return Outcome(status="checking", external_id=str(cid), check_after=self.later(10))
+
+    def _upload_with_resume(self, g: GraphClient, uri: str, path: Path, max_resumes: int = 3) -> None:
+        """Upload; if the server reports it holds fewer bytes than the file, resume from its offset."""
+        size = path.stat().st_size
+        offset = 0
+        for attempt in range(max_resumes + 1):
+            try:
+                g.rupload(uri, path, offset=offset)
+                return
+            except GraphError as exc:
+                status = g.rupload_status(uri)
+                log.warning("instagram: rupload error (%s); server reports %s for %d bytes", exc, status or "nothing", size)
+                got = status.get("offset") if isinstance(status, dict) else None
+                if isinstance(got, (int, str)) and str(got).isdigit() and int(got) < size and attempt < max_resumes:
+                    offset = int(got)
+                    log.info("instagram: resuming upload at byte %d of %d", offset, size)
+                    continue
+                raise
 
     def check(self, ctx: PublishContext, delivery) -> Outcome:
         g = self.client(ctx)

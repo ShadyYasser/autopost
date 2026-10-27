@@ -242,6 +242,7 @@ def test_instagram_rupload_error_but_container_processing_keeps_polling(app, vid
         ("POST", "17841411727741746/media", Resp(200, {"id": "C2"})),
         ("POST", "rupload.facebook.com", Resp(400, {"debug_info": {"retriable": False, "type": "ProcessingFailedError",
                                                                    "message": "Request processing failed"}})),
+        ("GET", "rupload.facebook.com", Resp(200, {})),        # upload status: nothing to resume
         ("GET", "/C2", Resp(200, {"status_code": "IN_PROGRESS", "status": "In Progress: Media is still being processed."})),
         ("GET", "/C2", Resp(200, {"status_code": "FINISHED"})),
         ("POST", "17841411727741746/media_publish", Resp(200, {"id": "M2"})),
@@ -295,3 +296,18 @@ def test_takwin_comments_stay_on(app, video_file):
     pub = InstagramPublisher(services)
     pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
     assert pub.check(ctx, delivery("C5")).status == "sent" and len(s.calls) == 3
+
+
+def test_instagram_resumes_partial_upload(app, video_file):
+    services, ctx = make_ctx(app, "takwin", "main", "instagram", video_file, {"text": "x"})
+    s = Session([
+        ("POST", "17841455147710531/media", Resp(200, {"id": "C6", "uri": "https://rupload.facebook.com/ig-api-upload/v26.0/C6"})),
+        ("POST", "ig-api-upload/v26.0/C6", Resp(400, {"debug_info": {"type": "ProcessingFailedError"}})),
+        ("GET", "ig-api-upload/v26.0/C6", Resp(200, {"offset": 400})),
+        ("POST", "ig-api-upload/v26.0/C6", Resp(200, {"success": True})),
+    ])
+    pub = InstagramPublisher(services)
+    pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
+    assert pub.publish(ctx).status == "checking"
+    resume = s.calls[-1][2]
+    assert resume["headers"]["offset"] == "400" and len(resume["data"]) == 600
