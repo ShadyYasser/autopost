@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -309,6 +309,27 @@ class InstagramPublisher(_MetaBase):
 
     def cancel(self, ctx: PublishContext, delivery) -> None:
         log.info("instagram: container %s left unpublished (deadline)", delivery.external_id)
+
+
+REQUIRED_SCOPES = ["pages_show_list", "pages_read_engagement", "pages_manage_posts",
+                   "instagram_basic", "instagram_content_publish"]
+
+
+def check_token_scopes(token: str, version: str, extra: list[str] = ()) -> list[str]:
+    """Inspect the token with debug_token (a token may inspect itself); returns lines to print."""
+    g = GraphClient(token, version)
+    try:
+        info = g.call("GET", "debug_token", params={"input_token": token}).get("data") or {}
+    except GraphError as exc:
+        return [f"? token details unavailable ({exc}); permissions will show on the first real post"]
+    scopes = set(info.get("scopes") or [])
+    expires = info.get("expires_at")
+    when = "never" if not expires else datetime.fromtimestamp(expires, timezone.utc).strftime("%Y-%m-%d")
+    lines = [f"{'✓' if info.get('is_valid') else '✗'} token: type {info.get('type')}, "
+             f"valid={info.get('is_valid')}, expires {when}"]
+    for scope in [*REQUIRED_SCOPES, *extra]:
+        lines.append(f"{'✓' if scope in scopes else '✗'} permission {scope}")
+    return lines
 
 
 def check_meta_access(token: str, version: str, page_id: str | None, ig_user_id: str | None) -> list[str]:

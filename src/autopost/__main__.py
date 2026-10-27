@@ -287,56 +287,99 @@ def cmd_sources(args, app: AppConfig) -> int:
 
 
 def cmd_check(args, app: AppConfig) -> int:
-    """Read-only checks of the credentials each enabled platform needs (nothing is posted)."""
+    """Read-only checks of everything the bot needs (nothing is posted)."""
+    from .platforms.buffer import BufferClient, BufferError
+    from .platforms.meta import check_meta_access, check_token_scopes
+
     secrets = Secrets()
     problems = 0
+
+    def show(line: str) -> None:
+        nonlocal problems
+        print(line)
+        problems += line.lstrip().startswith("✗")
+
+    print("=== Telegram ===")
     notifier = make_notifier(app, secrets, dry_run=False)
     bot = notifier.get_me()
-    print(f"{'✓' if bot else '✗'} Telegram bot {('@' + bot) if bot else 'token missing or invalid'}")
-    problems += not bot
+    show(f"{'✓' if bot else '✗'} bot {('@' + bot) if bot else 'token missing or invalid'}")
     if bot and args.ping_telegram:
-        ok = notifier.send("✅ autopost check: Telegram works.")
-        print(f"{'✓' if ok else '✗'} Telegram test message to the chat")
-        problems += not ok
+        show(f"{'✓' if notifier.send('✅ autopost check: Telegram works.') else '✗'} test message to the chat")
+
+    print("\n=== Google Drive / Sheets ===")
+    state, tmpdir = open_state(args.state, throwaway=True)
+    try:
+        content = make_content(app, state, secrets, dry_run=True)
+        if not isinstance(content, DriveContent):
+            show(f"✗ {app.settings.google.service_account_secret} missing")
+        else:
+            for brand in app.enabled_brands():
+                for stream in brand.streams:
+                    try:
+                        show(f"✓ {brand.id}/{stream}: {len(content.listing(brand.id, stream))} videos")
+                    except ContentError as exc:
+                        show(f"✗ {brand.id}/{stream}: {exc}")
+                src = brand.text_source
+                if getattr(src, "type", "") == "sheet":
+                    try:
+                        rows = content.sheet_rows(brand.id)
+                        can_edit = content.client.can_edit(src.sheet_id)
+                        show(f"{'✓' if can_edit else '✗'} {brand.id} sheet {content.sheet_tab(brand.id)}: "
+                             f"{len(rows)} rows, service account can edit: {'yes' if can_edit else 'NO'}")
+                    except (ContentError, GoogleError) as exc:
+                        show(f"✗ {brand.id} sheet: {exc}")
+    finally:
+        state.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
     version = app.settings.meta.graph_version
     for brand in app.enabled_brands():
-        print(f"\n=== {brand.id} ===")
-        seen = set()
-        for stream in brand.streams:
-            for platform in brand.enabled_platforms(stream):
-                cfg = brand.platform_for(stream, platform)
-                if platform in ("facebook", "instagram") and cfg.provider == "direct":
-                    key = (cfg.token_secret, cfg.page_id if platform == "facebook" else cfg.ig_user_id)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    if not secrets.has(cfg.token_secret):
-                        print(f"✗ {platform}: secret {cfg.token_secret} is missing")
-                        problems += 1
-                        continue
-                    from .platforms.meta import check_meta_access
+        print(f"\n=== Meta: {brand.id} ===")
+        tokens_seen = set()
+        for platform in ("facebook", "instagram"):
+            cfg = brand.platforms.get(platform)
+            if cfg is None or cfg.provider != "direct" or not cfg.enabled:
+                continue
+            if not secrets.has(cfg.token_secret):
+                show(f"✗ {platform}: secret {cfg.token_secret} is missing")
+                continue
+            token = secrets.get(cfg.token_secret)
+            if cfg.token_secret not in tokens_seen:
+                tokens_seen.add(cfg.token_secret)
+                extra = ["instagram_manage_comments"] if brand.comments == "off" else []
+                print(f"{cfg.token_secret}:")
+                for line in check_token_scopes(token, version, extra):
+                    show("  " + line)
+            for line in check_meta_access(token, version, cfg.page_id if platform == "facebook" else None,
+                                          cfg.ig_user_id if platform == "instagram" else None):
+                show(line)
 
-                    for line in check_meta_access(secrets.get(cfg.token_secret), version,
-                                                  cfg.page_id if platform == "facebook" else None,
-                                                  cfg.ig_user_id if platform == "instagram" else None):
-                        print(line)
-                        problems += line.startswith("✗")
-                elif cfg.provider == "buffer":
-                    name = app.settings.buffer_accounts[cfg.buffer_account].api_key_secret
-                    print(f"{'✓' if secrets.has(name) else '✗'} {platform} via Buffer ({cfg.buffer_account}): "
-                          f"secret {name} {'present' if secrets.has(name) else 'missing'} (API check in phase 4)")
-                    problems += not secrets.has(name)
-                elif platform == "youtube":
-                    mode = "Data API upload" if app.settings.youtube_direct.enabled else "manual hand-off on Telegram"
-                    print(f"✓ youtube direct ({stream}): {mode}")
-                elif platform == "pinterest":
-                    names = [cfg.access_token_secret] if cfg.access_token_secret else [
-                        app.settings.pinterest.app_id_secret, app.settings.pinterest.app_secret_secret,
-                        cfg.refresh_token_secret]
-                    missing = [n for n in names if not secrets.has(n)]
-                    print(f"{'✗' if missing else '✓'} pinterest ({app.settings.pinterest.environment}): "
-                          + (f"missing {', '.join(missing)}" if missing else "secrets present"))
-                    problems += bool(missing)
+    print("\n=== Buffer ===")
+    for name, acct in app.settings.buffer_accounts.items():
+        wanted = sorted({brand.platform_for(s, p).channel for brand in app.enabled_brands() for s in brand.streams
+                         for p in brand.enabled_platforms(s)
+                         if brand.platform_for(s, p).provider == "buffer"
+                         and brand.platform_for(s, p).buffer_account == name})
+        if not secrets.has(acct.api_key_secret):
+            show(f"✗ {name}: secret {acct.api_key_secret} is missing")
+            continue
+        client = BufferClient(secrets.get(acct.api_key_secret))
+        try:
+            account = client.account()
+            orgs = account.get("organizations") or []
+            show(f"✓ {name} ({acct.api_key_secret}): key works, {len(orgs)} organization(s)")
+            channels = [c for org in orgs for c in client.channels(org["id"])]
+        except BufferError as exc:
+            show(f"✗ {name} ({acct.api_key_secret}): {exc}")
+            continue
+        for c in channels:
+            flags = (" DISCONNECTED" if c.get("isDisconnected") else "") + (" LOCKED" if c.get("isLocked") else "")
+            print(f"   - {c['service']}: name={c.get('name')!r} display={c.get('displayName')!r}{flags}")
+        for want in wanted:
+            match = [c for c in channels if want.lower() in {str(c.get(k) or '').lower() for k in ('name', 'displayName')}]
+            show(f"{'✓' if match else '✗'} configured channel {want!r} "
+                 + (f"→ {match[0]['service']} {match[0]['id']}" if match else "not found in this account"))
+    print(f"\n{'all checks passed' if not problems else f'{problems} problem(s)'}")
     return 1 if problems else 0
 
 
