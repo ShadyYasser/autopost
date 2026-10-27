@@ -37,6 +37,10 @@ telegram:
   bot_token_secret: TELEGRAM_BOT_TOKEN
   chat_id_secret: TELEGRAM_CHAT_ID
 
+# healthchecks.io: every real run pings /start, then the plain URL (success) or /fail.
+healthcheck:
+  ping_url_secret: HEALTHCHECK_PING_URL
+
 media_hosting:
   github_release_tag: media-temp
 

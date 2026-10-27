@@ -174,13 +174,34 @@ def commit_state(reason: str) -> None:
 
 
 def cmd_run(args, app: AppConfig) -> int:
+    """Real runs report to healthchecks.io: /start now, then success or /fail (never blocking the run)."""
+    if args.dry_run:
+        return _run(args, app)[0]
+    import traceback
+
+    from .healthcheck import Healthcheck
+
+    secrets = Secrets()
+    name = app.settings.healthcheck.ping_url_secret
+    hc = Healthcheck(secrets.get(name) if secrets.has(name) else None)
+    hc.start()
+    try:
+        code, summary = _run(args, app)
+    except BaseException as exc:
+        hc.fail(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-3000:]}")
+        raise
+    (hc.success if code == 0 else hc.fail)(summary)
+    return code
+
+
+def _run(args, app: AppConfig) -> tuple[int, str]:
     scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule" or os.environ.get("AUTOPOST_TRIGGER") == "cron"
     dry = args.dry_run
     if not dry:
         maintenance(app, args.state)
     if scheduled and not app.settings.cron_enabled:
         log.info("cron_enabled is false in config/settings.yaml: scheduled run publishes nothing")
-        return 0
+        return 0, "cron_enabled is false: housekeeping only"
 
     secrets = Secrets()
     # Dry runs work on a throwaway copy of the state so nothing they do is ever committed.
@@ -191,7 +212,7 @@ def cmd_run(args, app: AppConfig) -> int:
     else:
         if now:
             print("--now only works in dry-run without --real-sleep", file=sys.stderr)
-            return 2
+            return 2, "bad arguments"
         clock = RealClock(app.settings.tz)
     use_clock_for_logs(app.settings.tz, clock.now if clock.simulated else None)
     notifier = make_notifier(app, secrets, dry_run=dry)
@@ -216,7 +237,7 @@ def cmd_run(args, app: AppConfig) -> int:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
     print(report.summary())
-    return 0
+    return 0, report.summary()
 
 
 def maintenance(app: AppConfig, state_path: str | Path) -> None:
@@ -233,6 +254,14 @@ def maintenance(app: AppConfig, state_path: str | Path) -> None:
             hide_facebook_comments(app, state, secrets, notifier, datetime.now(app.settings.tz))
         except Exception:  # noqa: BLE001 - housekeeping must never stop publishing
             log.exception("facebook comment hiding failed")
+        if app.settings.cron_enabled:
+            try:
+                from .summary import send_daily_summary
+
+                content = make_content(app, state, secrets, dry_run=True)   # read-only use
+                send_daily_summary(app, state, content, notifier, datetime.now(app.settings.tz))
+            except Exception:  # noqa: BLE001
+                log.exception("daily summary failed")
         host = GitHubReleaseHost.from_env(app.settings.media_hosting.github_release_tag)
         if host is not None:
             try:

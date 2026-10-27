@@ -91,12 +91,17 @@ jobs:
       # ffmpeg is installed by the bot itself, only when a post is due (from these cached Ubuntu
       # packages when possible, else apt). The key follows the runner image, so a new image gets a
       # fresh package set.
+      - name: ffmpeg cache key
+        if: env.COMMAND == 'run' || env.COMMAND == 'test-post'
+        id: ffkey
+        run: echo "key=ffmpeg-debs-${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
       - name: Cache ffmpeg packages
         if: env.COMMAND == 'run' || env.COMMAND == 'test-post'
         uses: actions/cache@v4
         with:
           path: ~/.cache/ffmpeg-debs
-          key: ffmpeg-debs-${{ runner.os }}-${{ env.ImageOS }}-${{ env.ImageVersion }}
+          key: ${{ steps.ffkey.outputs.key }}
 
       - name: Run
         env:

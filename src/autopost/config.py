@@ -165,6 +165,11 @@ class MediaConfig(_Model):
     max_fps: int = Field(30, ge=1)
 
 
+class HealthcheckConfig(_Model):
+    ping_url_secret: str = "HEALTHCHECK_PING_URL"
+    v_s = field_validator("ping_url_secret")(_check_secret_name)
+
+
 class Settings(_Model):
     timezone: str
     cron_enabled: bool = False
@@ -177,6 +182,7 @@ class Settings(_Model):
     daily_summary_time: str = "23:30"
     google: GoogleConfig
     telegram: TelegramConfig
+    healthcheck: HealthcheckConfig = Field(default_factory=HealthcheckConfig)
     media_hosting: MediaHostingConfig = Field(default_factory=MediaHostingConfig)
     buffer_accounts: dict[str, BufferAccountConfig] = Field(default_factory=dict)
     meta: MetaConfig = Field(default_factory=MetaConfig)
