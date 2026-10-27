@@ -103,6 +103,35 @@ def order_by_name_number(items: list[VideoItem]) -> tuple[list[VideoItem], list[
     return numbered + unnumbered, unnumbered
 
 
+def numbering_report(items: list[VideoItem]) -> dict:
+    """Numbers in the file names: range, missing numbers (as ranges), duplicates, unnumbered names."""
+    by_num: dict[int, list[str]] = {}
+    unnumbered = []
+    for v in items:
+        n = name_number(v.name)
+        if n is None:
+            unnumbered.append(v.name)
+        else:
+            by_num.setdefault(n, []).append(v.name)
+    nums = sorted(by_num)
+    gaps: list[tuple[int, int]] = []
+    for a, b in zip(nums, nums[1:]):
+        if b > a + 1:
+            gaps.append((a + 1, b - 1))
+    return {
+        "first": nums[0] if nums else None,
+        "last": nums[-1] if nums else None,
+        "count": len(nums),
+        "gaps": gaps,
+        "duplicates": {n: sorted(names) for n, names in by_num.items() if len(names) > 1},
+        "unnumbered": sorted(unnumbered),
+    }
+
+
+def format_ranges(ranges: list[tuple[int, int]]) -> str:
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in ranges)
+
+
 def choose_next_row(rows: list[SheetRow], cursor: tuple[int, datetime] | None = None) -> SheetRow:
     usable = [r for r in rows if all(r.values.values())]
     if not usable:

@@ -18,7 +18,7 @@ from .alerts.telegram import Notifier
 from .clock import RealClock, SimClock
 from .config import AppConfig, ConfigError, load_config, placeholder_values
 from .content.base import PlaceholderContent
-from .content.drive_source import ContentError, DriveContent, choose_next_row
+from .content.drive_source import ContentError, DriveContent, choose_next_row, format_ranges, numbering_report
 from .content.google_api import GoogleClient, GoogleError, session_from_service_account
 from .content.text import render
 from .platforms.base import DryRunPublisher
@@ -312,6 +312,12 @@ def cmd_sources(args, app: AppConfig) -> int:
                 per_day = len(stream.slots)
                 print(f"-- stream {stream_name}: {len(listing)} videos, {len(listing) - len(unused)} used, "
                       f"{len(unused)} left ≈ {len(unused) / per_day:.1f} days at {per_day}/day")
+                if stream.order == "name_number":
+                    rep = numbering_report(listing)
+                    print(f"   numbering: {rep['count']} numbered files, {rep['first']} → {rep['last']}; "
+                          f"missing: {format_ranges(rep['gaps']) or 'none'}; "
+                          f"duplicates: {'; '.join(f'{n}: ' + ', '.join(v) for n, v in rep['duplicates'].items()) or 'none'}; "
+                          f"unnumbered: {', '.join(rep['unnumbered']) or 'none'}")
                 cursor = state.caption_cursor(brand.id)
                 for i, video in enumerate(unused[: args.count]):
                     info = content.probe(video)

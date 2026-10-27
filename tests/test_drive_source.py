@@ -245,3 +245,14 @@ def test_takwin_uses_name_order_and_warns_once_per_set(app, tmp_path):
     assert [v.name for v in content.listing("takwin", "main")] == ["9.mp4", "68.mp4", "extra.mp4"]
     assert len(warnings) == 1 and "extra.mp4" in warnings[0][0]
     assert warnings[0][1].startswith("no-number:takwin:main:")
+
+
+def test_numbering_report_finds_gaps_duplicates_and_unnumbered():
+    from autopost.content.drive_source import format_ranges, numbering_report
+
+    names = ["1.mp4", "2.mp4", "5.mp4", "6.mp4", "6 (1).mp4", "9.mp4", "intro.mp4"]
+    rep = numbering_report([VideoItem(id=n, name=n, created=None) for n in names])
+    assert (rep["first"], rep["last"], rep["count"]) == (1, 9, 5)
+    assert format_ranges(rep["gaps"]) == "3-4, 7-8"
+    assert rep["duplicates"] == {6: ["6 (1).mp4", "6.mp4"]}
+    assert rep["unnumbered"] == ["intro.mp4"]
