@@ -68,7 +68,7 @@ platforms:
   youtube:
     provider: buffer
     buffer_account: youtube_acct
-    channel: "REPLACE_WITH_BUFFER_YOUTUBE_CHANNEL_NAME"
+    channel: "TAKWEN تكوين"
     shorts_check: { vertical: true, max_seconds: 180 }
     fallback: direct           # direct = manual Telegram hand-off while youtube_direct.enabled is false
     privacy: private

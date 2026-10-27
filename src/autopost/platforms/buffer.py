@@ -10,6 +10,12 @@ import requests
 API = "https://api.buffer.com"
 
 
+def channel_matches(channel: dict, wanted: str) -> bool:
+    """Configured channel name vs Buffer's name/displayName (case and extra spaces ignored)."""
+    norm = lambda v: " ".join(str(v or "").split()).casefold()  # noqa: E731
+    return norm(wanted) in {norm(channel.get("name")), norm(channel.get("displayName"))}
+
+
 class BufferError(Exception):
     pass
 

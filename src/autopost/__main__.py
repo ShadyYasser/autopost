@@ -288,7 +288,7 @@ def cmd_sources(args, app: AppConfig) -> int:
 
 def cmd_check(args, app: AppConfig) -> int:
     """Read-only checks of everything the bot needs (nothing is posted)."""
-    from .platforms.buffer import BufferClient, BufferError
+    from .platforms.buffer import BufferClient, BufferError, channel_matches
     from .platforms.meta import check_meta_access, check_token_scopes
 
     secrets = Secrets()
@@ -376,7 +376,7 @@ def cmd_check(args, app: AppConfig) -> int:
             flags = (" DISCONNECTED" if c.get("isDisconnected") else "") + (" LOCKED" if c.get("isLocked") else "")
             print(f"   - {c['service']}: name={c.get('name')!r} display={c.get('displayName')!r}{flags}")
         for want in wanted:
-            match = [c for c in channels if want.lower() in {str(c.get(k) or '').lower() for k in ('name', 'displayName')}]
+            match = [c for c in channels if channel_matches(c, want)]
             show(f"{'✓' if match else '✗'} configured channel {want!r} "
                  + (f"→ {match[0]['service']} {match[0]['id']}" if match else "not found in this account"))
     print(f"\n{'all checks passed' if not problems else f'{problems} problem(s)'}")

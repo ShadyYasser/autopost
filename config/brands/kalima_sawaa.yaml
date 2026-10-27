@@ -61,7 +61,7 @@ platforms:
   youtube:
     provider: buffer
     buffer_account: youtube_acct
-    channel: "REPLACE_WITH_BUFFER_YOUTUBE_CHANNEL_NAME"
+    channel: "Kalima Sawaa"
     shorts_check: { vertical: true, max_seconds: 180 }
     fallback: direct
     privacy: private
