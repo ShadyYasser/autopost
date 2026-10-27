@@ -371,7 +371,8 @@ def cmd_check(args, app: AppConfig) -> int:
             token = secrets.get(cfg.token_secret)
             if cfg.token_secret not in tokens_seen:
                 tokens_seen.add(cfg.token_secret)
-                extra = ["instagram_manage_comments"] if brand.comments == "off" else []
+                extra = ["instagram_manage_comments", "pages_read_user_content", "pages_manage_engagement"] \
+                    if brand.comments == "off" else []
                 print(f"{cfg.token_secret}:")
                 for line in check_token_scopes(token, version, extra):
                     show("  " + line)

@@ -424,7 +424,9 @@ def hide_facebook_comments(app, state, secrets, notifier, now, force: bool = Fal
             continue
         g = GraphClient(token, version)
         count = 0
-        for object_id in state.delivered_ids(brand.id, "facebook", now - timedelta(days=cfg.recent_days)):
+        targets = state.delivered_ids(brand.id, "facebook", now - timedelta(days=cfg.recent_days))
+        log.info("%s: sweeping comments on %d Facebook post(s)", brand.id, len(targets))
+        for object_id in targets:
             try:
                 comments = g.call("GET", f"{object_id}/comments", params={
                     "fields": "id,is_hidden,can_hide,from{id}", "filter": "stream", "limit": "100"}).get("data") or []
@@ -441,6 +443,5 @@ def hide_facebook_comments(app, state, secrets, notifier, now, force: bool = Fal
                     log.warning("could not hide comment %s: %s", c.get("id"), exc)
         state.kv_set(key, now.isoformat())
         hidden[brand.id] = count
-        if count:
-            log.info("%s: hid %d new Facebook comment(s)", brand.id, count)
+        log.info("%s: Facebook comment sweep done, %d comment(s) hidden", brand.id, count)
     return hidden
