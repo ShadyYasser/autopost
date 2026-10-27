@@ -101,6 +101,11 @@ class Runner:
         self.report = RunReport()
         self.services = Services(app=app, state=state, notifier=notifier, secrets=secrets, content=content,
                                  now=clock.now, advance=clock.advance, dry_run=dry_run)
+        if publishers is None:
+            from .platforms.registry import PublisherRegistry
+
+            publishers = PublisherRegistry(self.services)
+            self.publishers = publishers
         if brand_filter and brand_filter not in app.brands:
             raise ValueError(f"unknown brand {brand_filter!r}")
 

@@ -150,6 +150,12 @@ class YoutubeDirectConfig(_Model):
     v_s = field_validator("client_id_secret", "client_secret_secret")(_check_secret_name)
 
 
+class CommentHidingConfig(_Model):
+    """Facebook has no API to turn comments off, so for brands with `comments: off` the bot hides them."""
+    interval_minutes: int = Field(30, ge=5)     # how often to sweep
+    recent_days: int = Field(14, ge=1)          # posts younger than this are swept
+
+
 class MediaConfig(_Model):
     min_short_side: int = Field(720, ge=0)     # smaller videos are upscaled (lanczos) to this short side
     crf: int = Field(20, ge=0, le=51)
@@ -175,6 +181,7 @@ class Settings(_Model):
     buffer_accounts: dict[str, BufferAccountConfig] = Field(default_factory=dict)
     meta: MetaConfig = Field(default_factory=MetaConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
+    facebook_comment_hiding: CommentHidingConfig = Field(default_factory=CommentHidingConfig)
     pinterest: PinterestConfig
     youtube_direct: YoutubeDirectConfig
 
@@ -363,7 +370,8 @@ class PlatformConfig(_Model):
     # youtube
     shorts_check: ShortsCheck | None = None
     fallback: Literal["direct"] | None = None
-    privacy: Literal["private", "unlisted", "public"] = "private"
+    privacy: Literal["private", "unlisted", "public"] = "private"          # direct uploads
+    buffer_privacy: Literal["private", "unlisted", "public"] = "public"    # Shorts posted through Buffer
     category_id: str = "27"
     made_for_kids: bool = False
     refresh_token_secret: str | None = None

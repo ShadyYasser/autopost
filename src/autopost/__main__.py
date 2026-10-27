@@ -174,13 +174,12 @@ def commit_state(reason: str) -> None:
 
 def cmd_run(args, app: AppConfig) -> int:
     scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule" or os.environ.get("AUTOPOST_TRIGGER") == "cron"
-    if scheduled and not app.settings.cron_enabled:
-        log.info("cron_enabled is false in config/settings.yaml: scheduled run does nothing")
-        return 0
     dry = args.dry_run
     if not dry:
-        print("Scheduled publishing needs Buffer (phase 4). For a single real post use: test-post", file=sys.stderr)
-        return 2
+        maintenance(app, args.state)
+    if scheduled and not app.settings.cron_enabled:
+        log.info("cron_enabled is false in config/settings.yaml: scheduled run publishes nothing")
+        return 0
 
     secrets = Secrets()
     # Dry runs work on a throwaway copy of the state so nothing they do is ever committed.
@@ -200,7 +199,7 @@ def cmd_run(args, app: AppConfig) -> int:
     dry_pub = DryRunPublisher(download=args.download)
     runner = Runner(
         app, state, clock, notifier, content,
-        publishers=lambda platform, provider: dry_pub,
+        publishers=(lambda platform, provider: dry_pub) if dry else None,
         secrets=secrets,
         dry_run=dry,
         brand_filter=args.brand or None,
@@ -216,6 +215,30 @@ def cmd_run(args, app: AppConfig) -> int:
             shutil.rmtree(tmpdir, ignore_errors=True)
     print(report.summary())
     return 0
+
+
+def maintenance(app: AppConfig, state_path: str | Path) -> None:
+    """Housekeeping on every real run, even when publishing is switched off: hide Facebook comments
+    for brands with `comments: off`, and remove stale temporary videos from the media-temp release."""
+    from .hosting.github_release import GitHubReleaseHost
+    from .platforms.meta import hide_facebook_comments
+
+    secrets = Secrets()
+    state = State(state_path)
+    try:
+        notifier = make_notifier(app, secrets, dry_run=False)
+        try:
+            hide_facebook_comments(app, state, secrets, notifier, datetime.now(app.settings.tz))
+        except Exception:  # noqa: BLE001 - housekeeping must never stop publishing
+            log.exception("facebook comment hiding failed")
+        host = GitHubReleaseHost.from_env(app.settings.media_hosting.github_release_tag)
+        if host is not None:
+            try:
+                host.cleanup()
+            except Exception:  # noqa: BLE001
+                log.exception("media-temp cleanup failed")
+    finally:
+        state.close()
 
 
 def cmd_sources(args, app: AppConfig) -> int:

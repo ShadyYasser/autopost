@@ -381,3 +381,66 @@ def check_meta_access(token: str, version: str, page_id: str | None, ig_user_id:
         except GraphError as exc:
             out.append(f"✗ Instagram {ig_user_id}: {exc}")
     return out
+
+
+HIDE_SCOPES = ["pages_read_user_content", "pages_manage_engagement"]
+
+
+def token_scopes(token: str, version: str) -> set[str] | None:
+    try:
+        info = GraphClient(token, version).call("GET", "debug_token", params={"input_token": token}).get("data") or {}
+    except GraphError:
+        return None
+    return set(info.get("scopes") or [])
+
+
+def hide_facebook_comments(app, state, secrets, notifier, now, force: bool = False) -> dict[str, int]:
+    """For brands with `comments: off`: hide visitors' comments on their recent Facebook posts.
+
+    Runs at most every `facebook_comment_hiding.interval_minutes` per brand (unless force=True).
+    Without the needed permissions it does nothing and alerts once.
+    """
+    cfg = app.settings.facebook_comment_hiding
+    version = app.settings.meta.graph_version
+    hidden: dict[str, int] = {}
+    for brand in app.enabled_brands():
+        fb = brand.platforms.get("facebook")
+        if brand.comments != "off" or fb is None or fb.provider != "direct" or not fb.enabled:
+            continue
+        key = f"fb-comment-sweep:{brand.id}"
+        last = state.kv_get(key)
+        if not force and last and now - datetime.fromisoformat(last) < timedelta(minutes=cfg.interval_minutes):
+            continue
+        if not secrets.has(fb.token_secret):
+            continue
+        token = secrets.get(fb.token_secret)
+        scopes = token_scopes(token, version)
+        missing = [s for s in HIDE_SCOPES if scopes is not None and s not in scopes]
+        if scopes is None or missing:
+            notifier.alert(
+                f"{brand.name}: Facebook comments cannot be hidden yet. Add these permissions to the Meta app, "
+                f"regenerate the Page token and update {fb.token_secret}: {', '.join(missing or HIDE_SCOPES)}",
+                key=f"fb-hide-perms:{brand.id}:{','.join(missing)}", state=state, now=now)
+            continue
+        g = GraphClient(token, version)
+        count = 0
+        for object_id in state.delivered_ids(brand.id, "facebook", now - timedelta(days=cfg.recent_days)):
+            try:
+                comments = g.call("GET", f"{object_id}/comments", params={
+                    "fields": "id,is_hidden,can_hide,from{id}", "filter": "stream", "limit": "100"}).get("data") or []
+            except GraphError as exc:
+                log.warning("facebook comments of %s: %s", object_id, exc)
+                continue
+            for c in comments:
+                if c.get("is_hidden") or not c.get("can_hide") or (c.get("from") or {}).get("id") == fb.page_id:
+                    continue
+                try:
+                    g.call("POST", c["id"], data={"is_hidden": "true"})
+                    count += 1
+                except GraphError as exc:
+                    log.warning("could not hide comment %s: %s", c.get("id"), exc)
+        state.kv_set(key, now.isoformat())
+        hidden[brand.id] = count
+        if count:
+            log.info("%s: hid %d new Facebook comment(s)", brand.id, count)
+    return hidden

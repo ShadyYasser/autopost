@@ -300,6 +300,16 @@ class State:
         return list(self._exec("SELECT * FROM early_deliveries WHERE brand=? AND stream=? AND source_id=? "
                                "ORDER BY delivered_utc", (brand, stream, source_id)))
 
+    def delivered_ids(self, brand: str, platform: str, since: datetime) -> list[str]:
+        """External ids of posts delivered to `platform` since `since` (schedule and test posts)."""
+        rows = self._exec(
+            "SELECT d.external_id FROM deliveries d JOIN posts p ON p.id = d.post_id "
+            "WHERE p.brand=? AND d.platform=? AND d.status='sent' AND d.external_id IS NOT NULL AND d.updated_utc>=? "
+            "UNION SELECT external_id FROM early_deliveries WHERE brand=? AND platform=? AND status='sent' "
+            "AND external_id IS NOT NULL AND delivered_utc>=?",
+            (brand, platform, to_utc_str(since), brand, platform, to_utc_str(since)))
+        return [r[0] for r in rows]
+
     # ------------------------------------------------------------ caption cursor
 
     def caption_cursor(self, brand: str) -> tuple[int, datetime] | None:
