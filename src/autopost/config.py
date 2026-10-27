@@ -150,6 +150,14 @@ class YoutubeDirectConfig(_Model):
     v_s = field_validator("client_id_secret", "client_secret_secret")(_check_secret_name)
 
 
+class MediaConfig(_Model):
+    min_short_side: int = Field(720, ge=0)     # smaller videos are upscaled (lanczos) to this short side
+    crf: int = Field(20, ge=0, le=51)
+    preset: str = "veryfast"
+    audio_bitrate: str = "128k"
+    transcode_timeout_minutes: int = Field(60, ge=1)
+
+
 class Settings(_Model):
     timezone: str
     cron_enabled: bool = False
@@ -165,6 +173,7 @@ class Settings(_Model):
     media_hosting: MediaHostingConfig = Field(default_factory=MediaHostingConfig)
     buffer_accounts: dict[str, BufferAccountConfig] = Field(default_factory=dict)
     meta: MetaConfig = Field(default_factory=MetaConfig)
+    media: MediaConfig = Field(default_factory=MediaConfig)
     pinterest: PinterestConfig
     youtube_direct: YoutubeDirectConfig
 
@@ -340,6 +349,8 @@ class PlatformConfig(_Model):
     """Routing + platform options. Which fields are required depends on platform and provider."""
 
     provider: Literal["direct", "buffer"]
+    # false = leave this platform out of new posts (e.g. while its account is being set up)
+    enabled: bool = True
     # buffer
     buffer_account: str | None = None
     channel: str | None = None
@@ -357,8 +368,9 @@ class PlatformConfig(_Model):
     refresh_token_secret: str | None = None
     # pinterest
     board_id: str | None = None
+    access_token_secret: str | None = None   # alternative to refresh_token_secret (e.g. a sandbox token)
 
-    v_s = field_validator("token_secret", "refresh_token_secret")(_check_secret_name)
+    v_s = field_validator("token_secret", "refresh_token_secret", "access_token_secret")(_check_secret_name)
 
 
 class TemplateConfig(_Model):
@@ -369,6 +381,9 @@ class TemplateConfig(_Model):
 
 class StreamConfig(_Model):
     drive_folder_id: str
+    # created_time: oldest Drive createdTime first.
+    # name_number: by the number in the file name (2 before 10); files without a number come after.
+    order: Literal["created_time", "name_number"] = "created_time"
     slots: list[str] = Field(min_length=1)
     platforms: list[PlatformName] = Field(min_length=1)
     overrides: dict[PlatformName, dict[str, Any]] = Field(default_factory=dict)
@@ -405,6 +420,9 @@ class BrandConfig(_Model):
         base.update(self.streams[stream].overrides.get(platform, {}))
         return PlatformConfig.model_validate(base)
 
+    def enabled_platforms(self, stream: str) -> list[str]:
+        return [p for p in self.streams[stream].platforms if self.platform_for(stream, p).enabled]
+
     def streams_for_slot(self, slot: str) -> list[str]:
         return [name for name, s in self.streams.items() if slot in s.slots]
 
@@ -435,15 +453,20 @@ class AppConfig(BaseModel):
             for stream_name, stream in brand.streams.items():
                 for p in stream.platforms:
                     cfg = brand.platform_for(stream_name, p)
+                    if not cfg.enabled:
+                        continue
                     where = f"{brand.id}/{p}"
                     if cfg.provider == "buffer":
                         add(s.buffer_accounts[cfg.buffer_account].api_key_secret, where)
                     if p in ("facebook", "instagram") and cfg.provider == "direct":
                         add(cfg.token_secret, where)
                     if p == "pinterest" and cfg.provider == "direct":
-                        add(s.pinterest.app_id_secret, where)
-                        add(s.pinterest.app_secret_secret, where)
-                        add(cfg.refresh_token_secret, where)
+                        if cfg.access_token_secret:
+                            add(cfg.access_token_secret, where)
+                        else:
+                            add(s.pinterest.app_id_secret, where)
+                            add(s.pinterest.app_secret_secret, where)
+                            add(cfg.refresh_token_secret, where)
                     if p == "youtube" and s.youtube_direct.enabled and (
                         cfg.provider == "direct" or cfg.fallback == "direct"
                     ):
@@ -530,8 +553,8 @@ def _validate_platform(pp: str, platform: str, cfg: PlatformConfig, settings: Se
         errors.append(f"{pp}: needs `page_id` and `token_secret`")
     elif platform == "instagram" and not (cfg.ig_user_id and cfg.token_secret):
         errors.append(f"{pp}: needs `ig_user_id` and `token_secret`")
-    elif platform == "pinterest" and not (cfg.board_id and cfg.refresh_token_secret):
-        errors.append(f"{pp}: needs `board_id` and `refresh_token_secret`")
+    elif platform == "pinterest" and not (cfg.board_id and (cfg.refresh_token_secret or cfg.access_token_secret)):
+        errors.append(f"{pp}: needs `board_id` and `refresh_token_secret` (or `access_token_secret`)")
     if platform == "youtube":
         uses_direct = cfg.provider == "direct" or cfg.fallback == "direct"
         if uses_direct and settings.youtube_direct.enabled and not cfg.refresh_token_secret:

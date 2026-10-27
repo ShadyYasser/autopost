@@ -66,5 +66,6 @@ platforms:
     refresh_token_secret: YOUTUBE_REFRESH_TOKEN_KALIMA
   pinterest:
     provider: direct
+    enabled: false             # turn on once the board id and Pinterest secrets are set
     board_id: "REPLACE_WITH_PINTEREST_BOARD_ID"
     refresh_token_secret: PINTEREST_REFRESH_TOKEN_KALIMA

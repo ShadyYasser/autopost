@@ -138,11 +138,20 @@ def test_filename_titles_for_kalima(app, tmp_path):
     assert content.pick_text("kalima_sawaa", "long", v).variables == {"title": "حوار ناري:القس"}
 
 
-def test_fetch_and_release(app, tmp_path):
+def test_fetch_and_release(app, tmp_path, monkeypatch):
+    from autopost.media import MediaInfo
+
+    def fake_prepare(src, out_dir, settings):
+        out = out_dir / f"{src.stem}.prepared.mp4"
+        out.write_bytes(b"y")
+        return out, MediaInfo(240, 426, 5, vcodec="av1"), MediaInfo(720, 1280, 5, vcodec="h264")
+
+    monkeypatch.setattr("autopost.content.drive_source.prepare_for_upload", fake_prepare)
     content, _, _ = make(app, tmp_path)
     v = content.next_video("takwin", "main")
     v.local_path = content.fetch(v)
-    assert Path(v.local_path).exists()
+    assert Path(v.local_path).name.endswith(".prepared.mp4") and content.fetch(v) == v.local_path
+    assert content.probe(v).width == 720
     content.release(v)
     assert v.local_path is None and not any((tmp_path / "media").iterdir())
 
@@ -210,3 +219,29 @@ def test_download_size_mismatch_retries_then_fails(tmp_path, monkeypatch):
     with pytest.raises(GoogleError, match="incomplete"):
         GoogleClient(session).download("id", tmp_path / "v.mp4", expected_size=10)
     assert not list(tmp_path.iterdir())
+
+
+def test_order_by_name_number():
+    from autopost.content.drive_source import name_number, order_by_name_number
+
+    base = datetime(2026, 10, 26, 10, tzinfo=UTC)
+    names = ["68.mp4", "9.mp4", "293.mp4", "intro.mp4", "10.mp4", "10b.mp4", "2.mp4", "outro.mp4", "clip 2.mp4"]
+    items = [VideoItem(id=f"i{n}", name=name, created=base + timedelta(minutes=-n)) for n, name in enumerate(names)]
+    ordered, unnumbered = order_by_name_number(items)
+    assert [v.name for v in ordered] == ["2.mp4", "clip 2.mp4", "9.mp4", "10.mp4", "10b.mp4", "68.mp4", "293.mp4",
+                                         "outro.mp4", "intro.mp4"]          # unnumbered: oldest created first
+    assert {v.name for v in unnumbered} == {"intro.mp4", "outro.mp4"}
+    assert name_number("Copy of 7 حلقة.mp4") == 7 and name_number("بدون.mp4") is None
+
+
+def test_takwin_uses_name_order_and_warns_once_per_set(app, tmp_path):
+    warnings = []
+    content, state, client = make(app, tmp_path)
+    content.notify = lambda text, key: warnings.append((text, key))
+    base = datetime(2026, 10, 26, 10, tzinfo=UTC)
+    client.files["1YFMErkAWf1WvmY547qbShBk0DT5lSBQR"] = [
+        VideoItem(id="a", name="68.mp4", created=base), VideoItem(id="b", name="9.mp4", created=base),
+        VideoItem(id="c", name="extra.mp4", created=base)]
+    assert [v.name for v in content.listing("takwin", "main")] == ["9.mp4", "68.mp4", "extra.mp4"]
+    assert len(warnings) == 1 and "extra.mp4" in warnings[0][0]
+    assert warnings[0][1].startswith("no-number:takwin:main:")

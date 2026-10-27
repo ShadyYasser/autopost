@@ -81,7 +81,8 @@ def open_state(path: str | Path, throwaway: bool) -> tuple[State, str | None]:
     return State(copy), tmpdir
 
 
-def make_content(app: AppConfig, state: State, secrets: Secrets, dry_run: bool, placeholder: bool = False):
+def make_content(app: AppConfig, state: State, secrets: Secrets, dry_run: bool, placeholder: bool = False,
+                 notify=None):
     if placeholder:
         log.warning("using placeholder content (fake videos and texts)")
         return PlaceholderContent()
@@ -93,7 +94,7 @@ def make_content(app: AppConfig, state: State, secrets: Secrets, dry_run: bool, 
         raise MissingSecret(name)
     session, email = session_from_service_account(secrets.get(name))
     log.info("Google: service account %s", email)
-    return DriveContent(app, state, GoogleClient(session), work_dir(), dry_run)
+    return DriveContent(app, state, GoogleClient(session), work_dir(), dry_run, notify=notify)
 
 
 def parse_now(value: str | None, app: AppConfig) -> datetime | None:
@@ -176,7 +177,7 @@ def cmd_run(args, app: AppConfig) -> int:
         return 0
     dry = args.dry_run
     if not dry:
-        print("Real publishing is not implemented yet (phases 3–4). Use --dry-run.", file=sys.stderr)
+        print("Scheduled publishing needs Buffer (phase 4). For a single real post use: test-post", file=sys.stderr)
         return 2
 
     secrets = Secrets()
@@ -192,7 +193,8 @@ def cmd_run(args, app: AppConfig) -> int:
         clock = RealClock(app.settings.tz)
     use_clock_for_logs(app.settings.tz, clock.now if clock.simulated else None)
     notifier = make_notifier(app, secrets, dry_run=dry)
-    content = make_content(app, state, secrets, dry, placeholder=args.placeholder_content)
+    content = make_content(app, state, secrets, dry, placeholder=args.placeholder_content,
+                           notify=lambda text, key: notifier.alert(text, key=key, state=state, now=clock.now()))
     dry_pub = DryRunPublisher(download=args.download)
     runner = Runner(
         app, state, clock, notifier, content,
@@ -202,6 +204,7 @@ def cmd_run(args, app: AppConfig) -> int:
         brand_filter=args.brand or None,
         checkpoint=commit_state if os.environ.get("AUTOPOST_COMMIT_STATE") == "1" else None,
         max_runtime_minutes=args.max_runtime_minutes,
+        prefetch_media=not dry or args.download,
     )
     try:
         report = runner.run()
@@ -281,6 +284,133 @@ def cmd_sources(args, app: AppConfig) -> int:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def cmd_check(args, app: AppConfig) -> int:
+    """Read-only checks of the credentials each enabled platform needs (nothing is posted)."""
+    secrets = Secrets()
+    problems = 0
+    notifier = make_notifier(app, secrets, dry_run=False)
+    bot = notifier.get_me()
+    print(f"{'✓' if bot else '✗'} Telegram bot {('@' + bot) if bot else 'token missing or invalid'}")
+    problems += not bot
+    if bot and args.ping_telegram:
+        ok = notifier.send("✅ autopost check: Telegram works.")
+        print(f"{'✓' if ok else '✗'} Telegram test message to the chat")
+        problems += not ok
+    version = app.settings.meta.graph_version
+    for brand in app.enabled_brands():
+        print(f"\n=== {brand.id} ===")
+        seen = set()
+        for stream in brand.streams:
+            for platform in brand.enabled_platforms(stream):
+                cfg = brand.platform_for(stream, platform)
+                if platform in ("facebook", "instagram") and cfg.provider == "direct":
+                    key = (cfg.token_secret, cfg.page_id if platform == "facebook" else cfg.ig_user_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if not secrets.has(cfg.token_secret):
+                        print(f"✗ {platform}: secret {cfg.token_secret} is missing")
+                        problems += 1
+                        continue
+                    from .platforms.meta import check_meta_access
+
+                    for line in check_meta_access(secrets.get(cfg.token_secret), version,
+                                                  cfg.page_id if platform == "facebook" else None,
+                                                  cfg.ig_user_id if platform == "instagram" else None):
+                        print(line)
+                        problems += line.startswith("✗")
+                elif cfg.provider == "buffer":
+                    name = app.settings.buffer_accounts[cfg.buffer_account].api_key_secret
+                    print(f"{'✓' if secrets.has(name) else '✗'} {platform} via Buffer ({cfg.buffer_account}): "
+                          f"secret {name} {'present' if secrets.has(name) else 'missing'} (API check in phase 4)")
+                    problems += not secrets.has(name)
+                elif platform == "youtube":
+                    mode = "Data API upload" if app.settings.youtube_direct.enabled else "manual hand-off on Telegram"
+                    print(f"✓ youtube direct ({stream}): {mode}")
+                elif platform == "pinterest":
+                    names = [cfg.access_token_secret] if cfg.access_token_secret else [
+                        app.settings.pinterest.app_id_secret, app.settings.pinterest.app_secret_secret,
+                        cfg.refresh_token_secret]
+                    missing = [n for n in names if not secrets.has(n)]
+                    print(f"{'✗' if missing else '✓'} pinterest ({app.settings.pinterest.environment}): "
+                          + (f"missing {', '.join(missing)}" if missing else "secrets present"))
+                    problems += bool(missing)
+    return 1 if problems else 0
+
+
+def cmd_test_post(args, app: AppConfig) -> int:
+    """Publish ONE real post to ONE platform now. Nothing is recorded in state or the sheet."""
+    import time as _time
+
+    from .platforms.base import PublishContext, Services
+    from .platforms.registry import PublisherRegistry
+    from .state import DeliveryRow
+
+    brand = app.brands.get(args.brand)
+    if brand is None:
+        print(f"unknown brand {args.brand!r}", file=sys.stderr)
+        return 2
+    stream = args.stream or next(s for s, cfg in brand.streams.items() if args.platform in cfg.platforms)
+    if args.platform not in brand.streams[stream].platforms:
+        print(f"{brand.id}/{stream} does not publish to {args.platform}", file=sys.stderr)
+        return 2
+    cfg = brand.platform_for(stream, args.platform)
+    if not cfg.enabled:
+        log.warning("%s is disabled in config; testing it anyway", args.platform)
+    secrets = Secrets()
+    state, tmpdir = open_state(args.state, throwaway=True)
+    notifier = make_notifier(app, secrets, dry_run=False)
+    content = make_content(app, state, secrets, dry_run=True)   # dry_run here = never write the sheet
+    if not isinstance(content, DriveContent):
+        print("Google credentials missing", file=sys.stderr)
+        return 1
+    try:
+        if args.video:
+            matches = [v for v in content.listing(brand.id, stream) if args.video in (v.id, v.name)]
+            if not matches:
+                print(f"no video named {args.video!r} in {brand.id}/{stream}", file=sys.stderr)
+                return 2
+            video = matches[0]
+        else:
+            video = content.next_video(brand.id, stream)
+        text = content.pick_text(brand.id, stream, video)
+        texts = render(brand.templates[args.platform], args.platform, text.variables, app.settings.text_limits)
+        clock = RealClock(app.settings.tz)
+        services = Services(app=app, state=state, notifier=notifier, secrets=secrets, content=content,
+                            now=clock.now, advance=clock.advance, dry_run=False)
+        holder: dict = {}
+
+        def fetch():
+            if "path" not in holder:
+                holder["path"] = content.fetch(video)
+                video.local_path = holder["path"]
+            return holder["path"]
+
+        ctx = PublishContext(brand=brand, stream=stream, platform=args.platform, cfg=cfg, post_id=0, video=video,
+                             texts=texts, deadline=None, services=services, fetch_video=fetch,
+                             media_info=lambda: content.probe(video))
+        print(f"TEST POST {brand.id}/{stream} → {args.platform} via {cfg.provider}: {video.name}")
+        for k, v in texts.items():
+            print(f"  {k} [{len(v)}]: {v}")
+        publisher = PublisherRegistry(services)(args.platform, cfg.provider)
+        outcome = publisher.publish(ctx)
+        deadline = _time.monotonic() + 30 * 60
+        while outcome.status == "checking" and _time.monotonic() < deadline:
+            wait = max(5, (outcome.check_after - clock.now()).total_seconds()) if outcome.check_after else 15
+            log.info("waiting %.0fs for %s to finish processing…", wait, args.platform)
+            _time.sleep(wait)
+            outcome = publisher.check(ctx, DeliveryRow(0, 0, args.platform, cfg.provider, 0, "checking", 1,
+                                                       outcome.external_id, None, None, None))
+        result = f"{outcome.status}{(' ' + outcome.url) if outcome.url else ''}{(' — ' + outcome.error) if outcome.error else ''}"
+        print(f"RESULT: {result}")
+        notifier.send(f"🧪 Test post {brand.name} → {args.platform}: {result}\n{video.name}")
+        content.release(video)
+        return 0 if outcome.status in ("sent", "manual") else 1
+    finally:
+        state.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def cmd_status(args, app: AppConfig) -> int:
     state = State(args.state)
     tz = app.settings.tz
@@ -329,6 +459,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--download", action="store_true", help="dry-run: also download each video and ffprobe it")
     p.add_argument("--placeholder-content", action="store_true", help="dry-run: fake videos instead of Drive")
 
+    p = sub.add_parser("check", help="read-only credential checks (Telegram, Meta, Buffer/Pinterest secrets)")
+    p.add_argument("--ping-telegram", action="store_true", help="also send a test message")
+
+    p = sub.add_parser("test-post", help="publish ONE real post to ONE platform now (not recorded)")
+    p.add_argument("--brand", required=True)
+    p.add_argument("--platform", required=True, choices=["facebook", "instagram", "tiktok", "youtube", "pinterest"])
+    p.add_argument("--stream", help="default: the first stream of the brand that publishes to the platform")
+    p.add_argument("--video", help="file name or Drive id (default: the next unposted video)")
+
     p = sub.add_parser("sources", help="read-only preview of Drive videos and sheet texts")
     p.add_argument("--brand")
     p.add_argument("--count", type=int, default=3, help="videos to preview per stream")
@@ -345,7 +484,7 @@ def main(argv: list[str] | None = None) -> int:
     use_clock_for_logs(app.settings.tz)
     try:
         return {"validate": cmd_validate, "plan": cmd_plan, "run": cmd_run, "sources": cmd_sources,
-                "status": cmd_status}[args.command](
+                "check": cmd_check, "test-post": cmd_test_post, "status": cmd_status}[args.command](
             args, app)
     except (MissingSecret, GoogleError) as exc:
         print(str(exc), file=sys.stderr)

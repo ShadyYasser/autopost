@@ -11,17 +11,20 @@ cursor saved in state if that is newer); it wraps to the first data row after th
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from ..config import AppConfig, FilenameTextSource, SheetTextSource
-from ..media import MediaInfo, ProbeError, from_drive, probe
+from ..media import EncodeSettings, MediaInfo, ProbeError, TranscodeError, from_drive, prepare_for_upload, probe
 from ..state import State
 from .base import TextChoice, VideoItem
-from .google_api import GoogleClient, GoogleError, a1_sheet
+from .google_api import GoogleClient, GoogleError, a1_sheet, natural_key
 from .text import title_from_filename
 
 log = logging.getLogger(__name__)
@@ -81,6 +84,25 @@ def parse_rows(raw: list[list[str]], src: SheetTextSource, tz: ZoneInfo) -> list
     return rows
 
 
+_NUMBER = re.compile(r"\d+")
+
+
+def name_number(name: str) -> int | None:
+    """The first number in the file name (without extension), e.g. 68 for "68.mp4"."""
+    m = _NUMBER.search(Path(name).stem)
+    return int(m.group()) if m else None
+
+
+def order_by_name_number(items: list[VideoItem]) -> tuple[list[VideoItem], list[VideoItem]]:
+    """Numbered files by number (ties by full name), then unnumbered ones oldest-created first.
+    Returns (ordered, unnumbered)."""
+    numbered = [v for v in items if name_number(v.name) is not None]
+    unnumbered = [v for v in items if name_number(v.name) is None]
+    numbered.sort(key=lambda v: (name_number(v.name), natural_key(v.name), v.id))
+    unnumbered.sort(key=lambda v: (v.created or datetime.max.astimezone(), natural_key(v.name), v.id))
+    return numbered + unnumbered, unnumbered
+
+
 def choose_next_row(rows: list[SheetRow], cursor: tuple[int, datetime] | None = None) -> SheetRow:
     usable = [r for r in rows if all(r.values.values())]
     if not usable:
@@ -98,7 +120,8 @@ def choose_next_row(rows: list[SheetRow], cursor: tuple[int, datetime] | None = 
 
 
 class DriveContent:
-    def __init__(self, app: AppConfig, state: State, client: GoogleClient, work_dir: Path, dry_run: bool):
+    def __init__(self, app: AppConfig, state: State, client: GoogleClient, work_dir: Path, dry_run: bool,
+                 notify: Callable[[str, str], None] | None = None):
         self.app = app
         self.state = state
         self.client = client
@@ -108,6 +131,12 @@ class DriveContent:
         self._videos: dict[tuple[str, str], list[VideoItem]] = {}
         self._rows: dict[str, list[SheetRow]] = {}
         self._tabs: dict[str, str] = {}
+        self.notify = notify or (lambda text, key: log.warning("%s", text))
+        m = app.settings.media
+        self.encode = EncodeSettings(m.min_short_side, m.crf, m.preset, m.audio_bitrate,
+                                     m.transcode_timeout_minutes * 60)
+        # video id -> (prepared path, its media info, files to delete on release)
+        self._prepared: dict[str, tuple[Path, MediaInfo, list[Path]]] = {}
 
     # ------------------------------------------------------------ videos
 
@@ -116,9 +145,18 @@ class DriveContent:
         if key not in self._videos:
             folder = self.app.brands[brand].streams[stream].drive_folder_id
             try:
-                self._videos[key] = self.client.list_videos(folder)
+                items = self.client.list_videos(folder)
             except GoogleError as exc:
                 raise ContentError(f"cannot list Drive folder {folder} ({brand}/{stream}): {exc}") from exc
+            if self.app.brands[brand].streams[stream].order == "name_number":
+                items, unnumbered = order_by_name_number(items)
+                if unnumbered:
+                    names = sorted(v.name for v in unnumbered)
+                    digest = hashlib.sha1("|".join(sorted(v.id for v in unnumbered)).encode()).hexdigest()[:12]
+                    self.notify(f"{self.app.brands[brand].name}/{stream}: {len(names)} file(s) without a number in "
+                                f"the name will be posted after the numbered ones: " + ", ".join(names[:20]),
+                                f"no-number:{brand}:{stream}:{digest}")
+            self._videos[key] = items
             log.info("%s/%s: %d video(s) in Drive folder", brand, stream, len(self._videos[key]))
         return self._videos[key]
 
@@ -144,21 +182,36 @@ class DriveContent:
             return None
 
     def fetch(self, video: VideoItem) -> Path:
+        """Download once and prepare (transcode if needed); later calls reuse the prepared file."""
+        cached = self._prepared.get(video.id)
+        if cached and cached[0].exists():
+            return cached[0]
         suffix = Path(video.name).suffix.lower() or ".mp4"
         dest = self.work_dir / f"{video.id}{suffix}"
         log.info("downloading %s (%s)", video.name, _size(video.size))
         try:
-            return self.client.download(video.id, dest, video.size)
-        except GoogleError as exc:
-            raise ContentError(str(exc)) from exc
+            original = self.client.download(video.id, dest, video.size)
+            prepared, before, after = prepare_for_upload(original, self.work_dir, self.encode)
+        except (GoogleError, ProbeError, TranscodeError) as exc:
+            dest.unlink(missing_ok=True)
+            raise ContentError(f"{video.name}: {exc}") from exc
+        log.info("media for %s: original %s | upload %s", video.name, before.describe(), after.describe())
+        self._prepared[video.id] = (prepared, after, [original, prepared])
+        return prepared
 
     def release(self, video: VideoItem) -> None:
-        if video.local_path and Path(video.local_path).exists():
-            Path(video.local_path).unlink()
-            log.info("deleted local copy of %s", video.name)
+        _, _, files = self._prepared.pop(video.id, (None, None, []))
+        for f in {*files, *([Path(video.local_path)] if video.local_path else [])}:
+            if f.exists():
+                f.unlink()
+        if files or video.local_path:
+            log.info("deleted local copies of %s", video.name)
         video.local_path = None
 
     def probe(self, video: VideoItem) -> MediaInfo | None:
+        cached = self._prepared.get(video.id)
+        if cached:
+            return cached[1]
         if video.local_path:
             try:
                 return probe(video.local_path)

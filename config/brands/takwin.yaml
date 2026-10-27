@@ -39,6 +39,7 @@ text_source:
 streams:
   main:
     drive_folder_id: "1YFMErkAWf1WvmY547qbShBk0DT5lSBQR"
+    order: name_number         # 1.mp4, 2.mp4, … 10.mp4 (files without a number go last)
     slots: [fajr, maghrib, third]
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
 
@@ -75,5 +76,6 @@ platforms:
     refresh_token_secret: YOUTUBE_REFRESH_TOKEN_TAKWIN
   pinterest:
     provider: direct
+    enabled: false             # turn on once the board id and Pinterest secrets are set
     board_id: "REPLACE_WITH_PINTEREST_BOARD_ID"
     refresh_token_secret: PINTEREST_REFRESH_TOKEN_TAKWIN

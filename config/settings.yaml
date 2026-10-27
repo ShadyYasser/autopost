@@ -53,6 +53,14 @@ buffer_accounts:
 meta:
   graph_version: v26.0
 
+# Before upload every video becomes H.264 + AAC in MP4 (transcoded once per post when needed).
+media:
+  min_short_side: 720         # smaller videos are upscaled (lanczos) into 720x1280 / 1280x720, padded
+  crf: 20
+  preset: veryfast
+  audio_bitrate: 128k
+  transcode_timeout_minutes: 60
+
 pinterest:
   environment: sandbox        # sandbox | production
   app_id_secret: PINTEREST_APP_ID

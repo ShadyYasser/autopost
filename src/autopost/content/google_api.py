@@ -86,7 +86,7 @@ class GoogleClient:
             if not token:
                 break
             params["pageToken"] = token
-        items.sort(key=lambda v: (v.created or datetime.max.astimezone(), _natural(v.name), v.id))
+        items.sort(key=lambda v: (v.created or datetime.max.astimezone(), natural_key(v.name), v.id))
         return items
 
     def get_video(self, file_id: str) -> VideoItem:
@@ -165,7 +165,7 @@ def _video_item(f: dict) -> VideoItem:
     )
 
 
-def _natural(name: str):
+def natural_key(name: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
 
 

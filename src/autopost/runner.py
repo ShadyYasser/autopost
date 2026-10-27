@@ -81,7 +81,8 @@ class Runner:
     def __init__(self, app: AppConfig, state: State, clock, notifier: Notifier, content: ContentSource,
                  publishers: PublisherFactory, secrets: Secrets, rng: random.Random | None = None,
                  dry_run: bool = False, brand_filter: str | None = None,
-                 checkpoint: Callable[[str], None] | None = None, max_runtime_minutes: int = 120):
+                 checkpoint: Callable[[str], None] | None = None, max_runtime_minutes: int = 120,
+                 prefetch_media: bool = False):
         self.app = app
         self.settings = app.settings
         self.tz = app.settings.tz
@@ -95,6 +96,8 @@ class Runner:
         self.brand_filter = brand_filter
         self._checkpoint = checkpoint
         self.max_runtime = timedelta(minutes=max_runtime_minutes)
+        self.prefetch_media = prefetch_media
+        self._prefetched: set[tuple] = set()
         self.report = RunReport()
         self.services = Services(app=app, state=state, notifier=notifier, secrets=secrets, content=content,
                                  now=clock.now, advance=clock.advance, dry_run=dry_run)
@@ -198,7 +201,10 @@ class Runner:
                 log.exception("%s/%s: content error", brand.id, stream)
                 errors.append(f"{stream}: {exc}")
                 continue
-            platforms = list(brand.streams[stream].platforms)
+            platforms = brand.enabled_platforms(stream)
+            if not platforms:
+                log.warning("%s/%s: every platform is disabled; nothing to post", brand.id, stream)
+                continue
             self.rng.shuffle(platforms)
             routing = [(p, brand.platform_for(stream, p).provider) for p in platforms]
             post_id = self.state.create_post(brand.id, stream, slot.slot_date, slot.slot, video.id, video.name,
@@ -230,6 +236,22 @@ class Runner:
             self.report.skipped.append(label)
         self.checkpoint(f"start {brand.id} {slot.slot}")
         return chains
+
+    def prefetch(self, slot: SlotRow) -> None:
+        """While waiting for a slot, download (and transcode) its next video so the target is not delayed."""
+        key = (slot.brand, slot.slot_date, slot.slot)
+        if not self.prefetch_media or key in self._prefetched:
+            return
+        self._prefetched.add(key)
+        brand = self.app.brands[slot.brand]
+        for stream in brand.streams_for_slot(slot.slot):
+            try:
+                video = self.content.next_video(brand.id, stream)
+                if video is not None:
+                    log.info("preparing %s/%s ahead of %s: %s", brand.id, stream, self.fmt(slot.target), video.name)
+                    self.content.fetch(video)
+            except Exception as exc:  # noqa: BLE001 - it is retried when the slot starts
+                log.warning("prefetch for %s/%s failed: %s", brand.id, stream, exc)
 
     def warn_low_content(self, brand: BrandConfig, stream: str, now: datetime) -> None:
         remaining = self.content.remaining(brand.id, stream)
@@ -316,6 +338,10 @@ class Runner:
                 break
             earliest = min(next_times)
             if earliest > now:
+                if accepting and pending and pending[0].target == earliest:
+                    self.prefetch(pending[0])
+                    if self.clock.now() >= earliest:
+                        continue
                 self.clock.sleep_until(earliest)
                 continue
             ready = [i for i in items if i[1] <= now]

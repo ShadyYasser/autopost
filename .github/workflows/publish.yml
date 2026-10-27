@@ -13,7 +13,7 @@ on:
       command:
         description: "What to run"
         type: choice
-        options: [run, sources, validate, plan, status]
+        options: [run, test-post, check, sources, validate, plan, status]
         default: run
       brand:
         description: "Only this brand id (empty = all)"
@@ -24,9 +24,21 @@ on:
         type: string
         default: ""
       download:
-        description: "Dry run only: also download each video and check it with ffprobe"
+        description: "Dry run only: also download, transcode and ffprobe each video"
         type: boolean
         default: false
+      platform:
+        description: "test-post only: facebook | instagram | tiktok | youtube | pinterest"
+        type: string
+        default: ""
+      stream:
+        description: "test-post only (optional): e.g. long for Kalima Sawaa long videos"
+        type: string
+        default: ""
+      video:
+        description: "test-post only (optional): file name or Drive id (default: next unposted)"
+        type: string
+        default: ""
 
 permissions:
   contents: write   # commit state/state.db and manage the media-temp release
@@ -51,6 +63,9 @@ jobs:
       BRAND: ${{ github.event_name == 'workflow_dispatch' && inputs.brand || '' }}
       NOW: ${{ github.event_name == 'workflow_dispatch' && inputs.now || '' }}
       DOWNLOAD: ${{ github.event_name == 'workflow_dispatch' && inputs.download || false }}
+      PLATFORM: ${{ github.event_name == 'workflow_dispatch' && inputs.platform || '' }}
+      STREAM: ${{ github.event_name == 'workflow_dispatch' && inputs.stream || '' }}
+      VIDEO: ${{ github.event_name == 'workflow_dispatch' && inputs.video || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,7 +77,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          if [ "$COMMAND" = "run" ] && ! command -v ffprobe >/dev/null; then
+          if { [ "$COMMAND" = "run" ] || [ "$COMMAND" = "test-post" ]; } && ! command -v ffprobe >/dev/null; then
             sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg >/dev/null
           fi
 
@@ -79,6 +94,12 @@ jobs:
               [ -n "$NOW" ] && args+=(--now "$NOW")
               [ "$DOWNLOAD" = "true" ] && args+=(--download)
               ;;
+            test-post)
+              args+=(--brand "$BRAND" --platform "$PLATFORM")
+              [ -n "$STREAM" ] && args+=(--stream "$STREAM")
+              [ -n "$VIDEO" ] && args+=(--video "$VIDEO")
+              ;;
+            check) args+=(--ping-telegram) ;;
             sources) [ -n "$BRAND" ] && args+=(--brand "$BRAND") ;;
             validate) args+=(--check-secrets) ;;
             plan) [ -n "$BRAND" ] && args+=(--brand "$BRAND") ;;

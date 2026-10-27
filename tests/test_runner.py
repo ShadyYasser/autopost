@@ -77,6 +77,15 @@ class FakePublisher:
 TZ_DAY = date(2026, 10, 27)
 
 
+@pytest.fixture
+def app(app):
+    """Shipped config with every platform switched on (Pinterest is off until its account is ready)."""
+    for brand in app.brands.values():
+        for cfg in brand.platforms.values():
+            cfg.enabled = True
+    return app
+
+
 def make(app, tmp_path, now, content=None, pub=None, brand=None, seed=1, state=None):
     clock = SimClock(now)
     state = state or State(tmp_path / "state.db")
