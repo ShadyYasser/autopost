@@ -234,3 +234,21 @@ def test_youtube_direct_upload_when_enabled(app, video_file):
     assert meta["status"]["privacyStatus"] == "private"
     assert s.calls[2][2]["headers"]["Content-Range"] == "bytes 0-999/1000"
     assert "studio.youtube.com/video/YT1" in notifier.sent[-1]
+
+
+def test_instagram_rupload_error_but_container_processing_keeps_polling(app, video_file):
+    services, ctx = make_ctx(app, "kalima_sawaa", "short", "instagram", video_file, {"text": "x"})
+    s = Session([
+        ("POST", "17841411727741746/media", Resp(200, {"id": "C2"})),
+        ("POST", "rupload.facebook.com", Resp(400, {"debug_info": {"retriable": False, "type": "ProcessingFailedError",
+                                                                   "message": "Request processing failed"}})),
+        ("GET", "/C2", Resp(200, {"status_code": "IN_PROGRESS", "status": "In Progress: Media is still being processed."})),
+        ("GET", "/C2", Resp(200, {"status_code": "FINISHED"})),
+        ("POST", "17841411727741746/media_publish", Resp(200, {"id": "M2"})),
+        ("GET", "/M2", Resp(200, {"permalink": "https://www.instagram.com/reel/xyz/"})),
+    ])
+    pub = InstagramPublisher(services)
+    pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
+    out = pub.publish(ctx)
+    assert out.status == "checking" and out.external_id == "C2"
+    assert pub.check(ctx, delivery("C2")).url == "https://www.instagram.com/reel/xyz/"

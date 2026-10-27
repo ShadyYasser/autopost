@@ -243,13 +243,19 @@ class InstagramPublisher(_MetaBase):
         try:
             g.rupload(uri, path)
         except GraphError as exc:
-            # The rupload error is generic; the container status usually says what went wrong.
-            detail = ""
+            # rupload can answer "ProcessingFailedError" while Instagram is in fact still processing the
+            # file it received (seen with longer videos). The container status is the source of truth.
+            st = {}
             try:
                 st = g.call("GET", cid, params={"fields": "status_code,status"})
-                detail = f" | container {st.get('status_code')}: {st.get('status')}"
             except GraphError:
                 pass
+            code = st.get("status_code")
+            if code in ("IN_PROGRESS", "FINISHED"):
+                log.warning("instagram: upload answered %s but container %s is %s; continuing to poll",
+                            exc, cid, code)
+                return Outcome(status="checking", external_id=str(cid), check_after=self.later())
+            detail = f" | container {code}: {st.get('status')}" if st else ""
             log.error("instagram upload failed for %s (%.1f MB)%s", path.name, path.stat().st_size / 1_048_576, detail)
             return Outcome(status="failed", error=f"instagram upload: {exc}{detail}", retryable=True)
         log.info("instagram: uploaded to container %s; waiting for processing", cid)
