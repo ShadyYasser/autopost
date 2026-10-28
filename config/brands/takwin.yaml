@@ -35,6 +35,7 @@ text_source:
   header_rows: 1               # row 1 = caption | title | posted_at
   columns: { caption: A, title: B }
   posted_at_column: C
+  start_row: 3                 # first post uses row 3 (row 2 went with the 455.mp4 test post)
 
 streams:
   main:

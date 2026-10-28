@@ -80,6 +80,8 @@ class EncodeSettings:
     audio_bitrate: str = "128k"
     timeout_seconds: int = 3600
     max_fps: int = 30
+    transcode: str = "spec"        # spec | codec_only (only when not H.264 + AAC in MP4)
+    upscale: bool = True
 
 
 class ProbeError(Exception):
@@ -191,13 +193,15 @@ def transcode_reasons(info: MediaInfo, settings: EncodeSettings) -> list[str]:
     reasons = []
     if info.vcodec != "h264":
         reasons.append(f"video codec {info.vcodec}")
-    if info.pix_fmt not in ("yuv420p", "yuvj420p"):
-        reasons.append(f"pixel format {info.pix_fmt}")
     if info.acodec is not None and info.acodec != "aac":
         reasons.append(f"audio codec {info.acodec}")
     if "mp4" not in (info.container or "").split(","):
         reasons.append(f"container {info.container}")
-    if info.short_side < settings.min_short_side:
+    if settings.transcode == "codec_only":
+        return reasons
+    if info.pix_fmt not in ("yuv420p", "yuvj420p"):
+        reasons.append(f"pixel format {info.pix_fmt}")
+    if settings.upscale and info.short_side < settings.min_short_side:
         reasons.append(f"short side {info.short_side}px < {settings.min_short_side}px")
     if info.fps and info.fps > settings.max_fps + 0.5:
         reasons.append(f"{info.fps:g} fps > {settings.max_fps}")
@@ -224,7 +228,7 @@ def output_fps(info: MediaInfo, settings: EncodeSettings) -> float:
 
 def video_filter(info: MediaInfo, settings: EncodeSettings) -> tuple[str, tuple[int, int] | None]:
     fps = f"fps={output_fps(info, settings):g}"
-    if info.short_side < settings.min_short_side:
+    if settings.upscale and info.short_side < settings.min_short_side:
         w, h = target_box(info, settings.min_short_side)
         return (f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,"
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,{fps},format=yuv420p"), (w, h)

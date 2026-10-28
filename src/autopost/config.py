@@ -312,6 +312,14 @@ class SheetTextSource(_Model):
     header_rows: int = Field(1, ge=0)
     columns: dict[str, str]
     posted_at_column: str = "C"
+    # Sheet row (1-based, header included) to start the rotation from while no row has a posted date yet.
+    start_row: int | None = Field(None, ge=1)
+
+    @model_validator(mode="after")
+    def _start(self) -> "SheetTextSource":
+        if self.start_row is not None and self.start_row <= self.header_rows:
+            raise ValueError(f"start_row {self.start_row} is inside the header rows")
+        return self
 
     @field_validator("columns")
     @classmethod
@@ -343,6 +351,8 @@ class FilenameTextSource(_Model):
     strip_prefixes: list[str] = Field(default_factory=list)
     # Character replacements applied to the title (e.g. full-width "：" back to ":").
     replacements: dict[str, str] = Field(default_factory=dict)
+    # Files whose title is exactly one of these are not posted; you get one Telegram alert per file.
+    skip_titles: list[str] = Field(default_factory=list)
 
     def variables(self) -> set[str]:
         return {"title"}
@@ -394,19 +404,44 @@ class TemplateConfig(_Model):
     description: str | None = None
 
 
+class NewSplitConfig(_Model):
+    """Split a folder filled by tg2drive into a backlog (the initial backfill) and new reels."""
+    # The backlog is the first N Telegram messages (lowest msg_id). Once the folder holds N of them,
+    # the highest backlog msg_id is fixed in state; reels with a higher msg_id are "new".
+    backlog_size: int = Field(ge=1)
+    # Fix the boundary by hand instead (msg_id of the last backlog reel). Overrides the automatic one.
+    boundary_msg_id: int | None = None
+    # These slots take the oldest unposted NEW reel (backlog if none); the others take the backlog.
+    new_slots: list[str] = Field(min_length=1)
+
+
+class StreamMediaConfig(_Model):
+    # spec: transcode anything outside the Reels spec (codec, pixel format, fps, size, SAR, faststart)
+    # codec_only: transcode only when it is not H.264 + AAC in MP4 (e.g. HEVC, AV1)
+    transcode: Literal["spec", "codec_only"] = "spec"
+    upscale: bool = True              # false: never enlarge small videos
+
+
 class StreamConfig(_Model):
     drive_folder_id: str
     # created_time: oldest Drive createdTime first.
     # name_number: by the number in the file name (2 before 10); files without a number come after.
+    #   Ties (same createdTime) are broken by the Telegram msg_id of tg2drive files, then the name.
     order: Literal["created_time", "name_number"] = "created_time"
     slots: list[str] = Field(min_length=1)
     platforms: list[PlatformName] = Field(min_length=1)
     overrides: dict[PlatformName, dict[str, Any]] = Field(default_factory=dict)
+    new_split: NewSplitConfig | None = None
+    media: StreamMediaConfig = Field(default_factory=StreamMediaConfig)
 
     @model_validator(mode="after")
     def _folder(self) -> "StreamConfig":
         if len(set(self.platforms)) != len(self.platforms):
             raise ValueError("duplicate platform in stream")
+        if self.new_split:
+            extra = set(self.new_split.new_slots) - set(self.slots)
+            if extra:
+                raise ValueError(f"new_split.new_slots {sorted(extra)} are not slots of this stream")
         return self
 
 

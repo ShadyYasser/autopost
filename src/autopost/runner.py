@@ -197,7 +197,7 @@ class Runner:
         errors: list[str] = []
         for stream in brand.streams_for_slot(slot.slot):
             try:
-                video = self.content.next_video(brand.id, stream)
+                video = self.content.next_video(brand.id, stream, slot=slot.slot)
                 if video is None:
                     self.notifier.alert(
                         f"{brand.name}: no unposted videos left in stream '{stream}'. Slot {slot.slot} skipped for it.",
@@ -286,7 +286,7 @@ class Runner:
         brand = self.app.brands[slot.brand]
         for stream in brand.streams_for_slot(slot.slot):
             try:
-                video = self.content.next_video(brand.id, stream)
+                video = self.content.next_video(brand.id, stream, slot=slot.slot)
                 if video is not None:
                     log.info("preparing %s/%s ahead of %s: %s", brand.id, stream, self.fmt(slot.target), video.name)
                     self.content.fetch(video)

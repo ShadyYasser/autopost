@@ -13,17 +13,27 @@ slots:
 text_source:
   type: filename               # {title} = file name without extension
   strip_prefixes: ["Copy of ", "نسخة من "]
-  replacements:                # full-width characters that downloaders put in file names
+  replacements:
+    "⧸": "/"                   # tg2drive writes "/" in captions as "⧸"; ? : | are kept as they are
+    # full-width characters that video downloaders put in the long folder's file names
     "：": ":"
     "？": "?"
     "｜": "|"
     "＂": "\""
-    "⧸": "/"
+  skip_titles: ["معاذ عليان"]   # reel without a caption: not posted, one Telegram alert per file
 
 streams:
-  short:
+  short:                       # filled by tg2drive (ShadyYasser/tg2drive) from the Telegram group
     drive_folder_id: "1qf_opI5CAtrP5iDn3goNxAZY23rj7Z4c"
+    order: created_time        # upload order = group order; ties by Telegram msg_id
     slots: [morning, afternoon, night]
+    new_split:
+      backlog_size: 400        # the initial backfill; its last msg_id is fixed in state automatically
+      boundary_msg_id: null    # or set the last backlog msg_id here by hand
+      new_slots: [night]       # night: oldest new reel (backlog if none); morning/afternoon: backlog
+    media:
+      transcode: codec_only    # original Telegram files: re-encode only HEVC/AV1/etc.
+      upscale: false
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
   long:
     drive_folder_id: "1MKCjqE2rKpeT3dGfYtwe7LmYhnZ6CGdP"

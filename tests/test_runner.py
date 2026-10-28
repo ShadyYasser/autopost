@@ -24,7 +24,7 @@ class FakeContent:
         return self.videos.setdefault((brand, stream), [
             VideoItem(id=f"{brand}-{stream}-{i}", name=f"{stream}-{i}.mp4", created=None) for i in range(self.count)])
 
-    def next_video(self, brand, stream):
+    def next_video(self, brand, stream, slot=None):
         pool = self._pool(brand, stream)
         if not pool:
             return None

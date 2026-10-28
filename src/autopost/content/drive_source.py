@@ -1,7 +1,9 @@
 """Content from Google Drive (videos) and Google Sheets (captions/titles).
 
-Videos: video/* files directly inside each stream's folder, oldest Drive createdTime first,
-skipping any already used by a post of that brand/stream (tracked in state).
+Videos: video/* files directly inside each stream's folder, oldest Drive createdTime first
+(ties by Telegram msg_id, then name), or by the number in the file name; skipping any already
+used by a post of that brand/stream (tracked in state). A stream with `new_split` divides its
+folder into a backlog and new reels and picks from one or the other depending on the slot.
 
 Sheet texts rotate row by row, independently of the videos. The next row is the one after
 the most recently posted row, judged by the bot-written date in the posted_at column (or the
@@ -132,7 +134,8 @@ def format_ranges(ranges: list[tuple[int, int]]) -> str:
     return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in ranges)
 
 
-def choose_next_row(rows: list[SheetRow], cursor: tuple[int, datetime] | None = None) -> SheetRow:
+def choose_next_row(rows: list[SheetRow], cursor: tuple[int, datetime] | None = None,
+                    start_row: int | None = None) -> SheetRow:
     usable = [r for r in rows if all(r.values.values())]
     if not usable:
         raise ContentError("the sheet has no row with all text columns filled")
@@ -143,6 +146,8 @@ def choose_next_row(rows: list[SheetRow], cursor: tuple[int, datetime] | None = 
     if cursor and (last_when is None or cursor[1] > last_when):
         last_num = cursor[0]
     if last_num is None:
+        if start_row is not None:
+            return next((r for r in usable if r.number >= start_row), usable[0])
         return usable[0]
     following = [r for r in usable if r.number > last_num]
     return following[0] if following else usable[0]
@@ -167,6 +172,8 @@ class DriveContent:
                                      max_fps=m.max_fps)
         # video id -> (prepared path, its media info, files to delete on release)
         self._prepared: dict[str, tuple[Path, MediaInfo, list[Path]]] = {}
+        self._stream_of: dict[str, tuple[str, str]] = {}     # video id -> (brand, stream)
+        self._skipped: set[str] = set()
 
     # ------------------------------------------------------------ videos
 
@@ -187,15 +194,72 @@ class DriveContent:
                                 f"the name will be posted after the numbered ones: " + ", ".join(names[:20]),
                                 f"no-number:{brand}:{stream}:{digest}")
             self._videos[key] = items
+            for v in items:
+                self._stream_of[v.id] = key
             log.info("%s/%s: %d video(s) in Drive folder", brand, stream, len(self._videos[key]))
         return self._videos[key]
 
     def unused(self, brand: str, stream: str) -> list[VideoItem]:
         used = self.state.used_source_ids(brand, stream)
-        return [v for v in self.listing(brand, stream) if v.id not in used]
+        return [v for v in self.listing(brand, stream) if v.id not in used and not self.skipped_title(brand, stream, v)]
 
-    def next_video(self, brand: str, stream: str) -> VideoItem | None:
+    def skipped_title(self, brand: str, stream: str, video: VideoItem) -> bool:
+        """True for files whose title is in skip_titles (e.g. a reel without a caption); alerts once per file."""
+        src = self.app.brands[brand].text_source
+        if not isinstance(src, FilenameTextSource) or not src.skip_titles:
+            return False
+        title = title_from_filename(video.name, src.strip_prefixes, src.replacements).strip()
+        if title not in {t.strip() for t in src.skip_titles}:
+            return False
+        if video.id not in self._skipped:
+            self._skipped.add(video.id)
+            self.notify(f"{self.app.brands[brand].name}/{stream}: the file «{video.name}» has no caption, so it is "
+                        f"not posted. Rename it to the caption you want and it will be posted in its turn.\n"
+                        f"{video.web_link or video.id}", f"skip-title:{brand}:{video.id}")
+        return True
+
+    def split_boundary(self, brand: str, stream: str) -> int | None:
+        """Highest Telegram msg_id of the backlog, or None while the backfill is not complete."""
+        cfg = self.app.brands[brand].streams[stream].new_split
+        if cfg is None:
+            return None
+        if cfg.boundary_msg_id is not None:
+            return cfg.boundary_msg_id
+        key = f"new-split:{brand}:{stream}"
+        stored = self.state.kv_get(key)
+        if stored:
+            return int(stored)
+        ids = sorted(v.tg_msg_id for v in self.listing(brand, stream) if v.tg_msg_id is not None)
+        if len(ids) < cfg.backlog_size:
+            return None
+        boundary = ids[cfg.backlog_size - 1]
+        self.state.kv_set(key, str(boundary))
+        self.notify(f"{self.app.brands[brand].name}/{stream}: the backlog of {cfg.backlog_size} reels is complete "
+                    f"(last msg_id {boundary}). Reels with a higher msg_id now go to the "
+                    f"{', '.join(cfg.new_slots)} slot first.", key)
+        return boundary
+
+    def is_new(self, video: VideoItem, boundary: int | None) -> bool:
+        return boundary is not None and video.tg_msg_id is not None and video.tg_msg_id > boundary
+
+    def pools(self, brand: str, stream: str) -> tuple[list[VideoItem], list[VideoItem]] | None:
+        """(backlog, new) unposted videos for a stream with new_split, else None."""
+        if self.app.brands[brand].streams[stream].new_split is None:
+            return None
+        boundary = self.split_boundary(brand, stream)
         pending = self.unused(brand, stream)
+        return ([v for v in pending if not self.is_new(v, boundary)], [v for v in pending if self.is_new(v, boundary)])
+
+    def next_video(self, brand: str, stream: str, slot: str | None = None) -> VideoItem | None:
+        pools = self.pools(brand, stream) if slot is not None else None
+        if pools is None:
+            pending = self.unused(brand, stream)
+        else:
+            backlog, new = pools
+            # New-reel slots take the oldest new reel (backlog if none); the others the backlog (new reels
+            # once the backlog is used up).
+            new_slot = slot in self.app.brands[brand].streams[stream].new_split.new_slots
+            pending = new + backlog if new_slot else backlog + new
         return dataclasses.replace(pending[0]) if pending else None
 
     def remaining(self, brand: str, stream: str) -> int:
@@ -205,6 +269,7 @@ class DriveContent:
         for v in self.listing(brand, stream):
             if v.id == source_id:
                 return dataclasses.replace(v)
+        self._stream_of[source_id] = (brand, stream)
         try:
             return self.client.get_video(source_id)
         except GoogleError as exc:
@@ -221,13 +286,20 @@ class DriveContent:
         log.info("downloading %s (%s)", video.name, _size(video.size))
         try:
             original = self.client.download(video.id, dest, video.size)
-            prepared, before, after = prepare_for_upload(original, self.work_dir, self.encode)
+            prepared, before, after = prepare_for_upload(original, self.work_dir, self.encode_for(video))
         except (GoogleError, ProbeError, TranscodeError) as exc:
             dest.unlink(missing_ok=True)
             raise ContentError(f"{video.name}: {exc}") from exc
         log.info("media for %s: original %s | upload %s", video.name, before.describe(), after.describe())
         self._prepared[video.id] = (prepared, after, [original, prepared])
         return prepared
+
+    def encode_for(self, video: VideoItem) -> EncodeSettings:
+        where = self._stream_of.get(video.id)
+        if where is None:
+            return self.encode
+        m = self.app.brands[where[0]].streams[where[1]].media
+        return dataclasses.replace(self.encode, transcode=m.transcode, upscale=m.upscale)
 
     def release(self, video: VideoItem) -> None:
         _, _, files = self._prepared.pop(video.id, (None, None, []))
@@ -258,7 +330,7 @@ class DriveContent:
             if not title:
                 raise ContentError(f"empty title from file name {video.name!r}")
             return TextChoice(variables={"title": title})
-        row = choose_next_row(self.sheet_rows(brand), self.state.caption_cursor(brand))
+        row = choose_next_row(self.sheet_rows(brand), self.state.caption_cursor(brand), src.start_row)
         return TextChoice(variables=dict(row.values), row=row.number)
 
     def sheet_rows(self, brand: str) -> list[SheetRow]:

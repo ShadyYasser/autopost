@@ -98,15 +98,16 @@ class GraphClient:
         if size - offset <= MAX_IN_MEMORY:
             with path.open("rb") as fh:
                 fh.seek(offset)
-                body = fh.read()
+                payload = fh.read()
         else:
-            body = None
+            payload = None
         for attempt in range(1, self.attempts + 1):
             try:
-                if body is not None:
-                    resp = self.session.post(url, data=body, headers=headers, timeout=timeout)
+                if payload is not None:
+                    resp = self.session.post(url, data=payload, headers=headers, timeout=timeout)
                 else:
                     with path.open("rb") as fh:
+                        fh.seek(offset)
                         resp = self.session.post(url, data=fh, headers=headers, timeout=timeout)
             except requests.RequestException as exc:
                 if attempt == self.attempts:

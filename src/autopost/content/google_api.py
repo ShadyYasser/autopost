@@ -70,7 +70,7 @@ class GoogleClient:
         """Video files directly inside the folder (no subfolders, no other file types)."""
         params: dict[str, Any] = {
             "q": f"'{folder_id}' in parents and trashed = false and mimeType contains 'video/'",
-            "fields": "nextPageToken, files(id, name, mimeType, createdTime, size, webViewLink, "
+            "fields": "nextPageToken, files(id, name, mimeType, createdTime, size, webViewLink, appProperties, "
                       "videoMediaMetadata(width, height, durationMillis))",
             "pageSize": 1000,
             "orderBy": "createdTime",
@@ -86,12 +86,12 @@ class GoogleClient:
             if not token:
                 break
             params["pageToken"] = token
-        items.sort(key=lambda v: (v.created or datetime.max.astimezone(), natural_key(v.name), v.id))
+        items.sort(key=created_order)
         return items
 
     def get_video(self, file_id: str) -> VideoItem:
         f = self.request("GET", f"{DRIVE}/files/{file_id}", params={
-            "fields": "id, name, mimeType, createdTime, size, webViewLink, trashed, "
+            "fields": "id, name, mimeType, createdTime, size, webViewLink, trashed, appProperties, "
                       "videoMediaMetadata(width, height, durationMillis)",
             "supportsAllDrives": "true"}).json()
         return _video_item(f)
@@ -162,7 +162,14 @@ def _video_item(f: dict) -> VideoItem:
         height=meta.get("height"),
         duration_ms=int(meta["durationMillis"]) if meta.get("durationMillis") else None,
         web_link=f.get("webViewLink") or f"https://drive.google.com/file/d/{f['id']}/view",
+        app_properties=dict(f.get("appProperties") or {}),
     )
+
+
+def created_order(v: VideoItem):
+    """Oldest createdTime first; ties by Telegram msg_id (tg2drive files), then by name."""
+    msg = v.tg_msg_id
+    return (v.created or datetime.max.astimezone(), msg if msg is not None else float("inf"), natural_key(v.name), v.id)
 
 
 def natural_key(name: str):

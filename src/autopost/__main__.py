@@ -310,8 +310,25 @@ def cmd_sources(args, app: AppConfig) -> int:
                     problems += 1
                     continue
                 per_day = len(stream.slots)
-                print(f"-- stream {stream_name}: {len(listing)} videos, {len(listing) - len(unused)} used, "
-                      f"{len(unused)} left ≈ {len(unused) / per_day:.1f} days at {per_day}/day")
+                used_ids = state.used_source_ids(brand.id, stream_name)
+                used = sum(1 for v in listing if v.id in used_ids)
+                skipped = [v.name for v in listing if v.id not in used_ids and content.skipped_title(brand.id, stream_name, v)]
+                print(f"-- stream {stream_name}: {len(listing)} videos, {used} used, "
+                      f"{len(unused)} left ≈ {len(unused) / per_day:.1f} days at {per_day}/day"
+                      + (f"; skipped (no caption): {', '.join(skipped)}" if skipped else ""))
+                tg = sum(1 for v in listing if v.app_properties.get("source") == "tg2drive")
+                if tg:
+                    print(f"   tg2drive files: {tg}")
+                groups = [("", unused)]
+                pools = content.pools(brand.id, stream_name)
+                if pools is not None:
+                    split = stream.new_split
+                    boundary = content.split_boundary(brand.id, stream_name)
+                    print(f"   backlog: {len(pools[0])} left; new: {len(pools[1])} left; boundary: "
+                          + (f"msg_id {boundary}" if boundary is not None else
+                             f"not set yet (fixed once {split.backlog_size} reels are in the folder)")
+                          + f"; new-reel slots: {', '.join(split.new_slots)}")
+                    groups = [("backlog ", pools[0]), ("new ", pools[1])]
                 if stream.order == "name_number":
                     rep = numbering_report(listing)
                     print(f"   numbering: {rep['count']} numbered files, {rep['first']} → {rep['last']}; "
@@ -319,14 +336,16 @@ def cmd_sources(args, app: AppConfig) -> int:
                           f"duplicates: {'; '.join(f'{n}: ' + ', '.join(v) for n, v in rep['duplicates'].items()) or 'none'}; "
                           f"unnumbered: {', '.join(rep['unnumbered']) or 'none'}")
                 cursor = state.caption_cursor(brand.id)
-                for i, video in enumerate(unused[: args.count]):
+                shown_videos = [(label, i, v) for label, vids in groups for i, v in enumerate(vids[: args.count])]
+                for label, i, video in shown_videos:
                     info = content.probe(video)
                     created = video.created.astimezone(app.settings.tz).strftime("%Y-%m-%d %H:%M") if video.created else "?"
-                    print(f"  {i + 1}. {video.name}  [created {created}, {video.size or 0:,} B, "
+                    msg = f", msg {video.tg_msg_id}" if video.tg_msg_id is not None else ""
+                    print(f"  {label}{i + 1}. {video.name}  [created {created}{msg}, {video.size or 0:,} B, "
                           f"{info.describe() if info else 'no media metadata yet'}]")
                     try:
                         if getattr(src, "type", "") == "sheet":
-                            row = choose_next_row(content.sheet_rows(brand.id), cursor)
+                            row = choose_next_row(content.sheet_rows(brand.id), cursor, src.start_row)
                             cursor = (row.number, datetime.now(app.settings.tz) + timedelta(days=i + 1))
                             variables, where = row.values, f"sheet row {row.number}"
                         else:

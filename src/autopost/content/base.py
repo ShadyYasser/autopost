@@ -19,6 +19,14 @@ class VideoItem:
     duration_ms: int | None = None
     web_link: str | None = None
     local_path: Path | None = None
+    app_properties: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def tg_msg_id(self) -> int | None:
+        """Telegram message id from tg2drive's appProperties tg_key = "<chat_id>:<msg_id>"."""
+        key = self.app_properties.get("tg_key") or ""
+        tail = key.rsplit(":", 1)[-1]
+        return int(tail) if tail.lstrip("-").isdigit() else None
 
 
 @dataclass
@@ -29,7 +37,7 @@ class TextChoice:
 
 
 class ContentSource(Protocol):
-    def next_video(self, brand: str, stream: str) -> VideoItem | None: ...
+    def next_video(self, brand: str, stream: str, slot: str | None = None) -> VideoItem | None: ...
 
     def remaining(self, brand: str, stream: str) -> int: ...
 
@@ -52,7 +60,7 @@ class PlaceholderContent:
     def __init__(self) -> None:
         self._n = 0
 
-    def next_video(self, brand: str, stream: str) -> VideoItem | None:
+    def next_video(self, brand: str, stream: str, slot: str | None = None) -> VideoItem | None:
         self._n += 1
         return VideoItem(id=f"fake-{brand}-{stream}-{self._n}", name=f"{brand}-{stream}-video-{self._n}.mp4",
                          created=None, width=1080, height=1920, duration_ms=45_000)
