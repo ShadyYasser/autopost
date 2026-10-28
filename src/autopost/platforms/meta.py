@@ -31,6 +31,9 @@ TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 368, 613, 9007}
 POLL_SECONDS = 15
 MAX_IN_MEMORY = 512 * 1024 * 1024
 POLL_TIMEOUT = timedelta(minutes=25)
+# Instagram's upload server rejects big single-request uploads ("ProcessingFailedError", 0 bytes kept;
+# seen with a 74 MB reel). Above this size Instagram fetches the file from the public media host instead.
+IG_HOSTED_ABOVE_BYTES = 40 * 1024 * 1024
 
 
 class GraphError(Exception):
@@ -90,6 +93,29 @@ class GraphClient:
         except (requests.RequestException, ValueError):
             return {}
 
+    def rupload_hosted(self, url: str, file_url: str, timeout: int = 300) -> dict:
+        """Let the upload server fetch the video from a public URL (header file_url, no body)."""
+        for attempt in range(1, self.attempts + 1):
+            try:
+                resp = self.session.post(url, headers={**self.headers, "file_url": file_url}, timeout=timeout)
+            except requests.RequestException as exc:
+                if attempt == self.attempts:
+                    raise GraphError(f"upload network error: {type(exc).__name__}", transient=True) from exc
+                time.sleep(5 * attempt)
+                continue
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            if resp.status_code < 400 and "error" not in body and body.get("success", True) is not False:
+                return body
+            err = _graph_error(resp.status_code, body if "error" in body else {"error": {"message": resp.text[:300]}})
+            if resp.status_code >= 500 and attempt < self.attempts:
+                time.sleep(5 * attempt)
+                continue
+            raise err
+        raise GraphError("unreachable")
+
     def rupload(self, url: str, path: Path, timeout: int = 1800, offset: int = 0) -> dict:
         size = path.stat().st_size
         headers = {**self.headers, "offset": str(offset), "file_size": str(size),
@@ -136,6 +162,12 @@ def _graph_error(status: int, body: dict) -> GraphError:
     msg = e.get("error_user_msg") or e.get("message") or f"HTTP {status}"
     transient = bool(e.get("is_transient")) or code in TRANSIENT_CODES or status >= 500
     return GraphError(msg, code, e.get("error_subcode"), transient)
+
+
+def _held_bytes(status) -> int | None:
+    """Bytes the upload server says it holds for a session, if it says."""
+    got = status.get("offset") if isinstance(status, dict) else None
+    return int(got) if isinstance(got, (int, str)) and str(got).isdigit() else None
 
 
 class _MetaBase:
@@ -243,21 +275,41 @@ class FacebookPublisher(_MetaBase):
 
 
 class InstagramPublisher(_MetaBase):
+    def __init__(self, services, host=None):
+        super().__init__(services)
+        self.host = host        # public media host (GitHub Release) for big files
+        self._held: int | None = None
+
+    def _container(self, ctx: PublishContext, g: GraphClient) -> tuple[str, str]:
+        container = g.call("POST", f"{ctx.cfg.ig_user_id}/media", data={
+            "media_type": "REELS", "upload_type": "resumable", "caption": ctx.texts["text"],
+            "share_to_feed": "true"})
+        cid = container["id"]
+        return cid, container.get("uri") or RUPLOAD_IG.format(version=g.version, container=cid)
+
     def publish(self, ctx: PublishContext) -> Outcome:
         path = Path(ctx.fetch_video())
+        size = path.stat().st_size
         g = self.client(ctx)
-        ig = ctx.cfg.ig_user_id
         try:
-            container = g.call("POST", f"{ig}/media", data={
-                "media_type": "REELS", "upload_type": "resumable", "caption": ctx.texts["text"],
-                "share_to_feed": "true"})
-            cid = container["id"]
-            uri = container.get("uri") or RUPLOAD_IG.format(version=g.version, container=cid)
+            cid, uri = self._container(ctx, g)
         except (GraphError, KeyError) as exc:
             return self.failed(exc)
+        if self.host is not None and size > IG_HOSTED_ABOVE_BYTES:
+            return self._hosted(ctx, g, path, cid, uri)
         try:
             self._upload_with_resume(g, uri, path)
         except GraphError as exc:
+            held = self._held
+            if held is not None and held < size and self.host is not None:
+                # The server kept none (or part) of the file: this container can never finish.
+                log.warning("instagram: upload server kept %d of %d bytes; letting Instagram fetch the file "
+                            "from the media host instead", held, size)
+                try:
+                    cid, uri = self._container(ctx, g)
+                except (GraphError, KeyError) as exc2:
+                    return self.failed(exc2)
+                return self._hosted(ctx, g, path, cid, uri)
             # rupload can answer "ProcessingFailedError" while Instagram is in fact still processing the
             # file it received (seen with longer videos). The container status is the source of truth.
             st = {}
@@ -266,20 +318,40 @@ class InstagramPublisher(_MetaBase):
             except GraphError:
                 pass
             code = st.get("status_code")
-            if code in ("IN_PROGRESS", "FINISHED"):
+            if code in ("IN_PROGRESS", "FINISHED") and (held is None or held >= size):
                 log.warning("instagram: upload answered %s but container %s is %s; continuing to poll",
                             exc, cid, code)
                 return Outcome(status="checking", external_id=str(cid), check_after=self.later())
             detail = f" | container {code}: {st.get('status')}" if st else ""
-            log.error("instagram upload failed for %s (%.1f MB)%s", path.name, path.stat().st_size / 1_048_576, detail)
+            log.error("instagram upload failed for %s (%.1f MB)%s", path.name, size / 1_048_576, detail)
             return Outcome(status="failed", error=f"instagram upload: {exc}{detail}", retryable=True)
         log.info("instagram: uploaded to container %s; waiting for processing", cid)
         return Outcome(status="checking", external_id=str(cid), check_after=self.later(10))
+
+    def _hosted(self, ctx: PublishContext, g: GraphClient, path: Path, cid: str, uri: str) -> Outcome:
+        """Put the file on the public media host and let Instagram fetch it (header file_url)."""
+        asset_id = None
+        try:
+            url, asset_id = self.host.upload(path, f"{ctx.brand.id}-instagram")
+            g.rupload_hosted(uri, url)
+        except Exception as exc:  # noqa: BLE001 - hosting or upload trouble: retried like any failure
+            if asset_id is not None:
+                self.host.delete(asset_id)
+            log.error("instagram hosted upload failed for %s: %s", path.name, exc)
+            return Outcome(status="failed", error=f"instagram hosted upload: {exc}", retryable=True)
+        log.info("instagram: container %s fetches %s (%.1f MB); waiting for processing",
+                 cid, url, path.stat().st_size / 1_048_576)
+        return Outcome(status="checking", external_id=f"{cid}|{asset_id}", check_after=self.later(10))
+
+    def _release(self, asset_id: str) -> None:
+        if asset_id and self.host is not None:
+            self.host.delete(asset_id)
 
     def _upload_with_resume(self, g: GraphClient, uri: str, path: Path, max_resumes: int = 3) -> None:
         """Upload; if the server reports it holds fewer bytes than the file, resume from its offset."""
         size = path.stat().st_size
         offset = 0
+        self._held = None
         for attempt in range(max_resumes + 1):
             try:
                 g.rupload(uri, path, offset=offset)
@@ -287,25 +359,30 @@ class InstagramPublisher(_MetaBase):
             except GraphError as exc:
                 status = g.rupload_status(uri)
                 log.warning("instagram: rupload error (%s); server reports %s for %d bytes", exc, status or "nothing", size)
-                got = status.get("offset") if isinstance(status, dict) else None
-                if isinstance(got, (int, str)) and str(got).isdigit() and int(got) < size and attempt < max_resumes:
-                    offset = int(got)
+                self._held = got = _held_bytes(status)      # what the server kept (None: it does not say)
+                if got is not None and got < size and attempt < max_resumes:
+                    offset = got
                     log.info("instagram: resuming upload at byte %d of %d", offset, size)
                     continue
                 raise
 
     def check(self, ctx: PublishContext, delivery) -> Outcome:
         g = self.client(ctx)
-        cid = delivery.external_id
+        ext = delivery.external_id
+        cid, _, asset_id = (ext or "").partition("|")
         try:
             data = g.call("GET", cid, params={"fields": "status_code,status"})
         except GraphError as exc:
-            return self.failed(exc) if not exc.transient else Outcome(
-                status="checking", external_id=cid, check_after=self.later(30))
+            if not exc.transient:
+                self._release(asset_id)
+                return self.failed(exc)
+            return Outcome(status="checking", external_id=ext, check_after=self.later(30))
         code = data.get("status_code")
         if code in ("ERROR", "EXPIRED"):
+            self._release(asset_id)
             return Outcome(status="failed", external_id=cid, error=f"instagram container {code}: {data.get('status')}")
         if code == "FINISHED":
+            self._release(asset_id)
             try:
                 media_id = g.call("POST", f"{ctx.cfg.ig_user_id}/media_publish", data={"creation_id": cid})["id"]
             except GraphError as exc:
@@ -321,10 +398,12 @@ class InstagramPublisher(_MetaBase):
                 self.disable_comments(ctx, g, str(media_id), url)
             return Outcome(status="sent", external_id=str(media_id), url=url)
         if code == "PUBLISHED":
+            self._release(asset_id)
             return Outcome(status="sent", external_id=cid)
         if self.timed_out(delivery.id):
+            self._release(asset_id)
             return Outcome(status="failed", external_id=cid, error=f"instagram still processing after {POLL_TIMEOUT}")
-        return Outcome(status="checking", external_id=cid, check_after=self.later())
+        return Outcome(status="checking", external_id=ext, check_after=self.later())
 
     def disable_comments(self, ctx: PublishContext, g: GraphClient, media_id: str, url: str | None) -> bool:
         """Turn comments off on a published IG media. A failure is reported but does not undo the post."""
@@ -341,7 +420,9 @@ class InstagramPublisher(_MetaBase):
             return False
 
     def cancel(self, ctx: PublishContext, delivery) -> None:
-        log.info("instagram: container %s left unpublished (deadline)", delivery.external_id)
+        cid, _, asset_id = (delivery.external_id or "").partition("|")
+        self._release(asset_id)
+        log.info("instagram: container %s left unpublished (deadline)", cid)
 
 
 REQUIRED_SCOPES = ["pages_show_list", "pages_read_engagement", "pages_manage_posts",

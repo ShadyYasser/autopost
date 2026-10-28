@@ -28,7 +28,7 @@ class PublisherRegistry:
         if platform == "facebook":
             return FacebookPublisher(self.services)
         if platform == "instagram":
-            return InstagramPublisher(self.services)
+            return InstagramPublisher(self.services, self.host)
         if platform == "pinterest":
             return PinterestPublisher(self.services)
         if platform == "youtube":
