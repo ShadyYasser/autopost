@@ -155,3 +155,17 @@ def test_ensure_ffmpeg_falls_back_to_apt_and_alerts_when_slow(monkeypatch, tmp_p
     install = next(c for c in run.calls if "install" in c)
     assert f"Dir::Cache::archives={tmp_path / 'cache'}" in install
     assert alerts and "3.3 min" in alerts[0]
+
+
+@needs_ffmpeg
+def test_codec_only_keeps_size_and_quality_but_moves_moov_to_front(tmp_path):
+    from autopost.media import EncodeSettings, prepare_for_upload
+
+    src = tmp_path / "reel.mp4"          # ffmpeg writes the moov atom at the end by default
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=360x640:rate=30",
+                    "-f", "lavfi", "-i", "sine=sample_rate=44100", "-t", "2", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(src)], check=True)
+    out, before, after = prepare_for_upload(src, tmp_path / "out", EncodeSettings(transcode="codec_only", upscale=False))
+    assert before.faststart is False and after.faststart is True
+    assert (after.width, after.height, after.vcodec, after.sample_rate) == (360, 640, "h264", 44100)
+    assert abs(out.stat().st_size - src.stat().st_size) < 4096         # remux only, no re-encode

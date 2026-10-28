@@ -166,3 +166,29 @@ def test_rupload_retry_resends_the_file_from_the_offset(tmp_path, monkeypatch):
         s = Session()
         meta.GraphClient("t", "v26.0", session=s).rupload("https://rupload", f, offset=4)
         assert s.bodies == [b"456789", b"456789"]
+
+
+def test_telegram_fallback_over_50_mb_sends_the_drive_link(tmp_path):
+    from autopost.alerts.telegram import Notifier
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, data=None, files=None, timeout=None):
+            self.calls.append((url.rsplit("/", 1)[-1], data, files))
+
+            class R:
+                status_code = 200
+
+                def json(self):
+                    return {"ok": True, "result": {}}
+            return R()
+
+    big = tmp_path / "reel.mp4"
+    with big.open("wb") as fh:
+        fh.truncate(85 * 1024 * 1024)               # sparse 85 MB file
+    s = Session()
+    assert Notifier("tok", "chat", session=s).send_video(big, "caption", fallback_link="https://drive/x")
+    assert [c[0] for c in s.calls] == ["sendMessage"]
+    assert "https://drive/x" in s.calls[0][1]["text"] and "85 MB" in s.calls[0][1]["text"]

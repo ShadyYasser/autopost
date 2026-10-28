@@ -417,7 +417,8 @@ class NewSplitConfig(_Model):
 
 class StreamMediaConfig(_Model):
     # spec: transcode anything outside the Reels spec (codec, pixel format, fps, size, SAR, faststart)
-    # codec_only: transcode only when it is not H.264 + AAC in MP4 (e.g. HEVC, AV1)
+    # codec_only: transcode only when it is not H.264 + AAC in MP4 (e.g. HEVC, AV1); a file whose
+    #   index (moov atom) is at the end is only remuxed with +faststart (no re-encode)
     transcode: Literal["spec", "codec_only"] = "spec"
     upscale: bool = True              # false: never enlarge small videos
 

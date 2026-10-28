@@ -240,11 +240,14 @@ def prepare_for_upload(src: Path, out_dir: Path, settings: EncodeSettings | None
     settings = settings or EncodeSettings()
     before = probe(src)
     reasons = transcode_reasons(before, settings)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{src.stem}.prepared.mp4"
+    if not reasons and before.faststart is False:
+        # Only the index (moov atom) is at the end: move it to the front without re-encoding.
+        return _remux_faststart(src, out, before, settings)
     if not reasons:
         log.info("media OK as-is: %s", before.describe())
         return src, before, before
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{src.stem}.prepared.mp4"
     vf, box = video_filter(before, settings)
     gop = max(1, round(output_fps(before, settings) * 2))     # keyframe every 2 s
     cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?",
@@ -267,6 +270,22 @@ def prepare_for_upload(src: Path, out_dir: Path, settings: EncodeSettings | None
         raise TranscodeError(f"ffmpeg failed: {result.stderr.strip()[-400:]}")
     after = probe(out)
     log.info("transcoded in %.0fs: %s → %s", time.monotonic() - started, before.describe(), after.describe())
+    return out, before, after
+
+
+def _remux_faststart(src: Path, out: Path, before: MediaInfo, settings: EncodeSettings) -> tuple[Path, MediaInfo, MediaInfo]:
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-map", "0", "-c", "copy",
+           "-movflags", "+faststart", str(out)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=settings.timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        out.unlink(missing_ok=True)
+        raise TranscodeError(f"ffmpeg remux timed out after {settings.timeout_seconds}s") from exc
+    if result.returncode != 0:
+        out.unlink(missing_ok=True)
+        raise TranscodeError(f"ffmpeg remux failed: {result.stderr.strip()[-400:]}")
+    after = probe(out)
+    log.info("moved the moov atom to the front (no re-encode): %s", after.describe())
     return out, before, after
 
 
