@@ -584,7 +584,8 @@ def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str, modes: set[s
     """Diagnose Instagram uploads of one Drive video WITHOUT publishing: unpublished containers (they expire
     after 24 h) are fed the file in 8 MB pieces ("chunks"), by hosted URL with and without the redirect
     resolved ("hosted"), re-encoded to the Reels spec ("transcode") or cut to its first 60 s without
-    re-encoding ("trim60") or unchanged in one request ("plain"); then their processing status is reported."""
+    re-encoding ("trim60"), unchanged in one request ("plain") or as a classic video_url container
+    ("video_url"); then their processing status is reported."""
     import time
 
     import requests
@@ -636,6 +637,17 @@ def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str, modes: set[s
             print(f"{label} ({vpath.stat().st_size / 1_048_576:.1f} MB): uploaded")
         except GraphError as exc:
             print(f"{label} ({vpath.stat().st_size / 1_048_576:.1f} MB): upload answered {exc}")
+    # U: classic container fetched by Instagram from video_url (no rupload service involved)
+    if "video_url" in modes and host is not None:
+        url, asset = host.upload(path, f"{brand.id}-igtest")
+        assets.append(asset)
+        try:
+            c = g.call("POST", f"{ig}/media", data={"media_type": "REELS", "video_url": url,
+                                                    "caption": "upload test (video_url), not published"})
+            containers["U video_url"] = c["id"]
+            print(f"U video_url: container {c['id']} created")
+        except GraphError as exc:
+            print(f"U video_url: {exc}")
     # A: 8 MB pieces with the offset header
     if "chunks" in modes:
         cid, uri = container("chunks")
