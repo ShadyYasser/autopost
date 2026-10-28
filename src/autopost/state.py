@@ -212,6 +212,17 @@ class State:
             for r in self._exec(sql, params)
         ]
 
+    def update_slot_target(self, brand: str, day: date, slot: str, target: datetime, deadline: datetime | None,
+                           window: str | None, now: datetime, status: str = "scheduled",
+                           note: str | None = None) -> None:
+        """Re-plan a slot that has not started yet (the brand's schedule changed)."""
+        self._exec(
+            "UPDATE daily_slots SET target_utc=?, deadline_utc=?, window=?, status=?, note=?, updated_utc=? "
+            "WHERE brand=? AND slot_date=? AND slot=? AND status='scheduled'",
+            (to_utc_str(target), to_utc_str(deadline) if deadline else None, window, status, note,
+             to_utc_str(now), brand, day.isoformat(), slot),
+        )
+
     def set_slot_status(self, brand: str, day: date, slot: str, status: str, now: datetime,
                         note: str | None = None) -> None:
         self._exec(
@@ -251,6 +262,10 @@ class State:
 
     def post(self, post_id: int) -> sqlite3.Row:
         return self._exec("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+
+    def count_posts(self, brand: str, stream: str, day: date) -> int:
+        return self._exec("SELECT COUNT(*) FROM posts WHERE brand=? AND stream=? AND slot_date=?",
+                          (brand, stream, day.isoformat())).fetchone()[0]
 
     def posts_for_slot(self, brand: str, day: date, slot: str) -> list[sqlite3.Row]:
         return list(self._exec("SELECT * FROM posts WHERE brand=? AND slot_date=? AND slot=? ORDER BY id",

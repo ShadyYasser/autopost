@@ -27,10 +27,9 @@ streams:
     drive_folder_id: "1qf_opI5CAtrP5iDn3goNxAZY23rj7Z4c"
     order: created_time        # upload order = group order; ties by Telegram msg_id
     slots: [morning, afternoon, night]
-    new_split:
-      backlog_size: 400        # the initial backfill; its last msg_id is fixed in state automatically
-      boundary_msg_id: null    # or set the last backlog msg_id here by hand
-      new_slots: [night]       # night: oldest new reel (backlog if none); morning/afternoon: backlog
+    backfill:                  # daily-summary stats only: new reels vs the initial 400
+      size: 400                # its last msg_id is fixed in state once 400 reels are in the folder
+      boundary_msg_id: null    # or set the last backfill msg_id here by hand
     media:
       transcode: codec_only    # original Telegram files: re-encode only HEVC/AV1/etc.
       upscale: false

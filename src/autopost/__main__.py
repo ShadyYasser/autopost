@@ -319,22 +319,12 @@ def cmd_sources(args, app: AppConfig) -> int:
                 tg = sum(1 for v in listing if v.app_properties.get("source") == "tg2drive")
                 if tg:
                     print(f"   tg2drive files: {tg}")
+                stats = content.stream_stats(brand.id, stream_name, datetime.now(app.settings.tz).date())
+                if stats is not None:
+                    print(f"   backfill: {'complete' if stats['backfill_done'] else 'in progress'} "
+                          f"({stats['in_folder']}/{stats['backfill_size']} Telegram reels in the folder); "
+                          f"queue {stats['queue']} ({stats['queue_new']} new); received today {stats['received']}")
                 groups = [("", unused)]
-                pools = content.pools(brand.id, stream_name)
-                if pools is not None:
-                    split = stream.new_split
-                    boundary = content.split_boundary(brand.id, stream_name)
-                    print(f"   backlog: {len(pools[0])} left; new: {len(pools[1])} left; boundary: "
-                          + (f"msg_id {boundary}" if boundary is not None else
-                             f"not set yet (fixed once {split.backlog_size} reels are in the folder)")
-                          + f"; new-reel slots: {', '.join(split.new_slots)}")
-                    groups = [("backlog ", pools[0]), ("new ", pools[1])]
-                if stream.order == "name_number":
-                    rep = numbering_report(listing)
-                    print(f"   numbering: {rep['count']} numbered files, {rep['first']} → {rep['last']}; "
-                          f"missing: {format_ranges(rep['gaps']) or 'none'}; "
-                          f"duplicates: {'; '.join(f'{n}: ' + ', '.join(v) for n, v in rep['duplicates'].items()) or 'none'}; "
-                          f"unnumbered: {', '.join(rep['unnumbered']) or 'none'}")
                 cursor = state.caption_cursor(brand.id)
                 shown_videos = [(label, i, v) for label, vids in groups for i, v in enumerate(vids[: args.count])]
                 for label, i, video in shown_videos:

@@ -50,6 +50,14 @@ def build_daily_summary(app: AppConfig, state: State, content, day: date, now: d
             days = left / max(1, len(stream.slots))
             warn = " ⚠️ أضف محتوى" if days <= app.settings.low_content_warning_days else ""
             lines.append(f"  المتبقي ({stream_name}): {left} فيديو ≈ {days:.0f} يوم{warn}")
+            stats = getattr(content, "stream_stats", lambda *a: None)(brand.id, stream_name, day)
+            if stats:
+                lines.append(f"  ريلز ({stream_name}): وصل اليوم {stats['received']} (جديد {stats['received_new']}) · "
+                             f"نُشر اليوم {stats['posted']} · في الطابور {stats['queue']}: "
+                             f"{stats['queue_new']} جديد + {stats['queue'] - stats['queue_new']} "
+                             f"من أول {stats['backfill_size']}"
+                             + ("" if stats["backfill_done"] else
+                                f" (التحميل الأولي جارٍ: {stats['in_folder']}/{stats['backfill_size']})"))
     usage = []
     for name, acct in app.settings.buffer_accounts.items():
         used = state.buffer_requests_since(name, now - timedelta(days=1))

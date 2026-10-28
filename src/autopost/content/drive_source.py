@@ -1,9 +1,8 @@
 """Content from Google Drive (videos) and Google Sheets (captions/titles).
 
 Videos: video/* files directly inside each stream's folder, oldest Drive createdTime first
-(ties by Telegram msg_id, then name), or by the number in the file name; skipping any already
-used by a post of that brand/stream (tracked in state). A stream with `new_split` divides its
-folder into a backlog and new reels and picks from one or the other depending on the slot.
+(ties by Telegram msg_id, then name), by the number in the file name, or newest Telegram msg_id
+first; skipping any already used by a post of that brand/stream (tracked in state).
 
 Sheet texts rotate row by row, independently of the videos. The next row is the one after
 the most recently posted row, judged by the bot-written date in the posted_at column (or the
@@ -105,6 +104,13 @@ def order_by_name_number(items: list[VideoItem]) -> tuple[list[VideoItem], list[
     return numbered + unnumbered, unnumbered
 
 
+def order_newest_first(items: list[VideoItem]) -> list[VideoItem]:
+    """Highest Telegram msg_id first; files without one after them, newest createdTime first."""
+    oldest = datetime.min.replace(tzinfo=ZoneInfo("UTC"))
+    return sorted(items, key=lambda v: (v.tg_msg_id is not None, v.tg_msg_id or 0, v.created or oldest,
+                                        v.name), reverse=True)
+
+
 def numbering_report(items: list[VideoItem]) -> dict:
     """Numbers in the file names: range, missing numbers (as ranges), duplicates, unnumbered names."""
     by_num: dict[int, list[str]] = {}
@@ -185,7 +191,10 @@ class DriveContent:
                 items = self.client.list_videos(folder)
             except GoogleError as exc:
                 raise ContentError(f"cannot list Drive folder {folder} ({brand}/{stream}): {exc}") from exc
-            if self.app.brands[brand].streams[stream].order == "name_number":
+            order = self.app.brands[brand].streams[stream].order
+            if order == "newest_first":
+                items = order_newest_first(items)
+            if order == "name_number":
                 items, unnumbered = order_by_name_number(items)
                 if unnumbered:
                     names = sorted(v.name for v in unnumbered)
@@ -218,48 +227,51 @@ class DriveContent:
                         f"{video.web_link or video.id}", f"skip-title:{brand}:{video.id}")
         return True
 
-    def split_boundary(self, brand: str, stream: str) -> int | None:
-        """Highest Telegram msg_id of the backlog, or None while the backfill is not complete."""
-        cfg = self.app.brands[brand].streams[stream].new_split
+    def backfill_boundary(self, brand: str, stream: str) -> int | None:
+        """Highest Telegram msg_id of the initial backfill, or None while it is not complete."""
+        cfg = self.app.brands[brand].streams[stream].backfill
         if cfg is None:
             return None
         if cfg.boundary_msg_id is not None:
             return cfg.boundary_msg_id
-        key = f"new-split:{brand}:{stream}"
+        key = f"backfill:{brand}:{stream}"
         stored = self.state.kv_get(key)
         if stored:
             return int(stored)
         ids = sorted(v.tg_msg_id for v in self.listing(brand, stream) if v.tg_msg_id is not None)
-        if len(ids) < cfg.backlog_size:
+        if len(ids) < cfg.size:
             return None
-        boundary = ids[cfg.backlog_size - 1]
+        boundary = ids[cfg.size - 1]
         self.state.kv_set(key, str(boundary))
-        self.notify(f"{self.app.brands[brand].name}/{stream}: the backlog of {cfg.backlog_size} reels is complete "
-                    f"(last msg_id {boundary}). Reels with a higher msg_id now go to the "
-                    f"{', '.join(cfg.new_slots)} slot first.", key)
+        self.notify(f"{self.app.brands[brand].name}/{stream}: the initial {cfg.size} reels are all in Drive "
+                    f"(last msg_id {boundary}); later reels count as new in the daily summary.", key)
         return boundary
 
     def is_new(self, video: VideoItem, boundary: int | None) -> bool:
         return boundary is not None and video.tg_msg_id is not None and video.tg_msg_id > boundary
 
-    def pools(self, brand: str, stream: str) -> tuple[list[VideoItem], list[VideoItem]] | None:
-        """(backlog, new) unposted videos for a stream with new_split, else None."""
-        if self.app.brands[brand].streams[stream].new_split is None:
+    def stream_stats(self, brand: str, stream: str, day) -> dict | None:
+        """Daily-summary figures for a tg2drive stream (one with `backfill`), else None."""
+        cfg = self.app.brands[brand].streams[stream].backfill
+        if cfg is None:
             return None
-        boundary = self.split_boundary(brand, stream)
-        pending = self.unused(brand, stream)
-        return ([v for v in pending if not self.is_new(v, boundary)], [v for v in pending if self.is_new(v, boundary)])
+        boundary = self.backfill_boundary(brand, stream)
+        listing = self.listing(brand, stream)
+        received = [v for v in listing if v.created and v.created.astimezone(self.tz).date() == day]
+        queue = self.unused(brand, stream)
+        return {
+            "received": len(received),
+            "received_new": sum(1 for v in received if self.is_new(v, boundary)),
+            "posted": self.state.count_posts(brand, stream, day),
+            "queue": len(queue),
+            "queue_new": sum(1 for v in queue if self.is_new(v, boundary)),
+            "backfill_size": cfg.size,
+            "backfill_done": boundary is not None,
+            "in_folder": sum(1 for v in listing if v.tg_msg_id is not None),
+        }
 
     def next_video(self, brand: str, stream: str, slot: str | None = None) -> VideoItem | None:
-        pools = self.pools(brand, stream) if slot is not None else None
-        if pools is None:
-            pending = self.unused(brand, stream)
-        else:
-            backlog, new = pools
-            # New-reel slots take the oldest new reel (backlog if none); the others the backlog (new reels
-            # once the backlog is used up).
-            new_slot = slot in self.app.brands[brand].streams[stream].new_split.new_slots
-            pending = new + backlog if new_slot else backlog + new
+        pending = self.unused(brand, stream)
         return dataclasses.replace(pending[0]) if pending else None
 
     def remaining(self, brand: str, stream: str) -> int:

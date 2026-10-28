@@ -1,4 +1,4 @@
-"""Kalima short folder filled by tg2drive: ordering, backlog/new split, captionless files, media policy."""
+"""Kalima short folder filled by tg2drive: newest-first order, backfill stats, captionless files, media policy."""
 
 from datetime import date, datetime, timedelta, timezone
 
@@ -33,8 +33,8 @@ def post(state, video_id, slot="morning"):
                       [("facebook", "direct")], BASE)
 
 
-def small_split(app, size=3):
-    app.brands["kalima_sawaa"].streams["short"].new_split.backlog_size = size
+def small_backfill(app, size=3):
+    app.brands["kalima_sawaa"].streams["short"].backfill.size = size
 
 
 def test_created_time_ties_broken_by_msg_id_not_name_or_numbers():
@@ -45,48 +45,40 @@ def test_created_time_ties_broken_by_msg_id_not_name_or_numbers():
     assert VideoItem(id="x", name="x", created=None).tg_msg_id is None
 
 
-def test_backlog_until_backfill_complete_then_night_takes_new(app, tmp_path):
-    small_split(app)
+def test_every_slot_posts_the_newest_unposted_reel(app, tmp_path):
+    app.brands["kalima_sawaa"].streams["short"].order = "newest_first"
+    content, state, client = make(app, tmp_path)
+    # uploaded oldest first by the backfill; a newer reel uploaded earlier still wins on msg_id
+    fill(client, [reel(10), reel(11), reel(12), reel(40, minute=-5)])
+    order = []
+    for slot in ("morning", "afternoon", "evening", "night"):
+        v = content.next_video("kalima_sawaa", "short", slot=slot)
+        order.append(v.id)
+        post(state, v.id, slot)
+    assert order == ["m40", "m12", "m11", "m10"]
+    assert content.next_video("kalima_sawaa", "short", slot="morning") is None
+
+
+def test_backfill_stats_for_the_daily_summary(app, tmp_path):
+    small_backfill(app)
     content, state, client = make(app, tmp_path)
     fill(client, [reel(10), reel(11)])
-    # backfill incomplete: no boundary, every slot takes the oldest reel
-    assert content.split_boundary("kalima_sawaa", "short") is None
-    assert content.next_video("kalima_sawaa", "short", slot="night").id == "m10"
+    s = content.stream_stats("kalima_sawaa", "short", BASE.date())
+    assert (s["backfill_done"], s["queue"], s["queue_new"], s["in_folder"]) == (False, 2, 0, 2)
 
-    content, state2, client = make(app, tmp_path / "b")
-    fill(client, [reel(10), reel(11), reel(12), reel(30), reel(31)])
-    assert content.split_boundary("kalima_sawaa", "short") == 12
-    assert state2.kv_get("new-split:kalima_sawaa:short") == "12"
-    assert content.next_video("kalima_sawaa", "short", slot="night").id == "m30"
-    assert content.next_video("kalima_sawaa", "short", slot="morning").id == "m10"
-    post(state2, "m30", "night")
-    post(state2, "m31", "night")
-    assert content.next_video("kalima_sawaa", "short", slot="night").id == "m10"      # no new reel: backlog
-    for vid in ("m10", "m11", "m12"):
-        post(state2, vid)
-    assert content.next_video("kalima_sawaa", "short", slot="afternoon") is None
-
-
-def test_boundary_is_frozen_and_can_be_set_in_config(app, tmp_path):
-    small_split(app)
-    content, state, client = make(app, tmp_path)
-    fill(client, [reel(10), reel(11), reel(12), reel(30)])
-    assert content.split_boundary("kalima_sawaa", "short") == 12
-    # a backlog reel is deleted later: the boundary stays where it was
-    content, _, client = make(app, tmp_path)
-    fill(client, [reel(11), reel(12), reel(30), reel(31)])
-    assert content.split_boundary("kalima_sawaa", "short") == 12
-    app.brands["kalima_sawaa"].streams["short"].new_split.boundary_msg_id = 30
-    assert content.split_boundary("kalima_sawaa", "short") == 30
-    assert content.next_video("kalima_sawaa", "short", slot="night").id == "m31"
-
-
-def test_backlog_slots_use_new_reels_once_backlog_is_empty(app, tmp_path):
-    small_split(app, size=1)
-    content, state, client = make(app, tmp_path)
-    fill(client, [reel(10), reel(20), reel(21)])
-    post(state, "m10")
-    assert content.next_video("kalima_sawaa", "short", slot="morning").id == "m20"
+    content, state, client = make(app, tmp_path / "b")
+    fill(client, [reel(10), reel(11), reel(12), reel(30), reel(31, minute=24 * 60)])
+    post(state, "m31")
+    s = content.stream_stats("kalima_sawaa", "short", BASE.date())
+    assert state.kv_get("backfill:kalima_sawaa:short") == "12"
+    assert (s["backfill_done"], s["queue"], s["queue_new"]) == (True, 4, 1)
+    assert (s["received"], s["received_new"]) == (4, 1)          # m31 arrived the next day
+    # the boundary stays fixed when backfill files are deleted; config can override it
+    content, _, client = make(app, tmp_path / "b")
+    fill(client, [reel(11), reel(30), reel(31)])
+    assert content.backfill_boundary("kalima_sawaa", "short") == 12
+    app.brands["kalima_sawaa"].streams["short"].backfill.boundary_msg_id = 30
+    assert content.backfill_boundary("kalima_sawaa", "short") == 30
 
 
 def test_captionless_file_is_skipped_with_one_alert(app, tmp_path):
@@ -112,7 +104,7 @@ def test_posts_of_deleted_files_do_not_change_counts(app, tmp_path):
         post(state, old)
     fill(client, [reel(10), reel(11)])
     assert content.remaining("kalima_sawaa", "short") == 2
-    assert content.next_video("kalima_sawaa", "short", slot="morning").id == "m10"
+    assert content.next_video("kalima_sawaa", "short", slot="morning").id == "m10"      # oldest first
 
 
 def test_takwin_rotation_starts_at_configured_row(app):

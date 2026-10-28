@@ -404,15 +404,13 @@ class TemplateConfig(_Model):
     description: str | None = None
 
 
-class NewSplitConfig(_Model):
-    """Split a folder filled by tg2drive into a backlog (the initial backfill) and new reels."""
-    # The backlog is the first N Telegram messages (lowest msg_id). Once the folder holds N of them,
-    # the highest backlog msg_id is fixed in state; reels with a higher msg_id are "new".
-    backlog_size: int = Field(ge=1)
-    # Fix the boundary by hand instead (msg_id of the last backlog reel). Overrides the automatic one.
+class BackfillConfig(_Model):
+    """A folder filled by tg2drive: its first `size` Telegram messages (lowest msg_id) are the initial
+    backfill; later reels are "new". Used for the daily summary only (not for ordering)."""
+    size: int = Field(ge=1)
+    # Once the folder holds `size` reels the highest backfill msg_id is fixed in state automatically;
+    # set it here to override.
     boundary_msg_id: int | None = None
-    # These slots take the oldest unposted NEW reel (backlog if none); the others take the backlog.
-    new_slots: list[str] = Field(min_length=1)
 
 
 class StreamMediaConfig(_Model):
@@ -426,23 +424,20 @@ class StreamMediaConfig(_Model):
 class StreamConfig(_Model):
     drive_folder_id: str
     # created_time: oldest Drive createdTime first.
-    # name_number: by the number in the file name (2 before 10); files without a number come after.
     #   Ties (same createdTime) are broken by the Telegram msg_id of tg2drive files, then the name.
-    order: Literal["created_time", "name_number"] = "created_time"
+    # name_number: by the number in the file name (2 before 10); files without a number come after.
+    # newest_first: highest Telegram msg_id first (tg2drive files), then newest createdTime.
+    order: Literal["created_time", "name_number", "newest_first"] = "created_time"
     slots: list[str] = Field(min_length=1)
     platforms: list[PlatformName] = Field(min_length=1)
     overrides: dict[PlatformName, dict[str, Any]] = Field(default_factory=dict)
-    new_split: NewSplitConfig | None = None
+    backfill: BackfillConfig | None = None
     media: StreamMediaConfig = Field(default_factory=StreamMediaConfig)
 
     @model_validator(mode="after")
     def _folder(self) -> "StreamConfig":
         if len(set(self.platforms)) != len(self.platforms):
             raise ValueError("duplicate platform in stream")
-        if self.new_split:
-            extra = set(self.new_split.new_slots) - set(self.slots)
-            if extra:
-                raise ValueError(f"new_split.new_slots {sorted(extra)} are not slots of this stream")
         return self
 
 

@@ -23,7 +23,7 @@ from .config import AppConfig, BrandConfig
 from .content.base import ContentSource, TextChoice, VideoItem
 from .content.text import render
 from .platforms.base import Outcome, Publisher, PublishContext, Services
-from .scheduler import ScheduleError, plan_brand_day
+from .scheduler import ScheduleError, SlotPlan, plan_brand_day, slots_fingerprint
 from .secret_store import Secrets
 from .state import FINAL_DELIVERY, DeliveryRow, SlotRow, State
 
@@ -152,8 +152,16 @@ class Runner:
     def ensure_slots(self, now: datetime) -> None:
         today = self.local_today(now)
         for brand in self.brands():
+            fp_key = f"slots-config:{brand.id}"
+            fingerprint = slots_fingerprint(self.app, brand)
+            stored = self.state.kv_get(fp_key)
             for day in (today - timedelta(days=1), today, today + timedelta(days=1)):
                 if self.state.has_slots(brand.id, day):
+                    if day >= today and stored != fingerprint:
+                        names = {s.slot for s in self.state.slots(brand=brand.id, days=[day])}
+                        # No fingerprint yet (first run with this check): only a visible change counts.
+                        if stored is not None or names != set(brand.slots):
+                            self.replan_day(brand, day, now)
                     continue
                 try:
                     plans = plan_brand_day(self.app, brand, day, self.rng)
@@ -169,6 +177,40 @@ class Runner:
                     log.info("%s %s %-8s target %s%s%s", brand.id, day, p.slot, self.fmt(p.target),
                              f" (window {p.window})" if p.window else "",
                              f" deadline {self.fmt(p.deadline)}" if p.deadline else "")
+
+            if stored != fingerprint:
+                self.state.kv_set(fp_key, fingerprint)
+
+    def replan_day(self, brand: BrandConfig, day: date, now: datetime) -> None:
+        """The brand's slot config changed: re-draw the day's slots that have not started yet.
+        Started, finished and skipped slots keep their time; slots no longer in the config are dropped."""
+        existing = {s.slot: s for s in self.state.slots(brand=brand.id, days=[day])}
+        fixed = {name: SlotPlan(brand.id, day, name, s.target, s.deadline, s.window)
+                 for name, s in existing.items() if s.status != "scheduled"}
+        try:
+            plans = plan_brand_day(self.app, brand, day, self.rng, fixed=fixed)
+        except ScheduleError as exc:
+            self.notifier.alert(f"{brand.name}: could not re-plan slots for {day}: {exc}",
+                                key=f"schedule-error:{brand.id}:{day}", state=self.state, now=now)
+            return
+        names = {p.slot for p in plans}
+        for name, s in existing.items():
+            if s.status == "scheduled" and name not in names:
+                self.state.set_slot_status(brand.id, day, name, "skipped", now, note="removed from the schedule")
+                log.info("%s %s %-9s removed from the schedule", brand.id, day, name)
+        for p in plans:
+            if p.slot in fixed:
+                continue
+            late = self.too_late(brand, p.slot, p.target, p.deadline, now)
+            status, note = ("skipped", "created after its time") if late else ("scheduled", None)
+            if p.slot in existing:
+                self.state.update_slot_target(brand.id, day, p.slot, p.target, p.deadline, p.window, now,
+                                              status=status, note=note)
+            else:
+                self.state.insert_slot(brand.id, day, p.slot, p.target, p.deadline, p.window, now,
+                                       status=status, note=note)
+            log.info("%s %s %-9s re-planned: target %s%s", brand.id, day, p.slot, self.fmt(p.target),
+                     " (already past: skipped)" if late else "")
 
     def due_slots(self, now: datetime) -> list[SlotRow]:
         today = self.local_today(now)

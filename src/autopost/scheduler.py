@@ -7,6 +7,8 @@ belongs to the date it is computed for, even when its target falls after midnigh
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import random
 from dataclasses import dataclass
@@ -118,16 +120,23 @@ def compute_day(
     rng: random.Random,
     min_spacing_minutes: int = 0,
     attempts: int = 200,
+    fixed: dict[str, SlotPlan] | None = None,
 ) -> list[SlotPlan]:
+    """Draw every slot of the day. `fixed` slots (already started) keep their time; the others are
+    re-drawn until all are at least min_spacing_minutes apart."""
     prayer = prayer or _no_prayers
+    fixed = fixed or {}
     min_gap = timedelta(minutes=min_spacing_minutes)
     plans: list[SlotPlan] = []
     for _ in range(attempts):
         plans = []
         for name, slot in brand.slots.items():
+            if name in fixed:
+                plans.append(fixed[name])
+                continue
             target, deadline, label = compute_slot(slot, day, tz, prayer, rng)
             plans.append(SlotPlan(brand.id, day, name, target, deadline, label))
-        if _spaced(plans, min_gap):
+        if _spaced(plans + [p for n, p in fixed.items() if n not in brand.slots], min_gap):
             break
     else:
         log.warning("%s %s: could not keep slots %s min apart; using last draw", brand.id, day, min_spacing_minutes)
@@ -141,8 +150,18 @@ def prayer_lookup_for(app: AppConfig, brand: BrandConfig) -> PrayerLookup | None
     return PrayerCalculator(cfg, app.settings.tz).time
 
 
-def plan_brand_day(app: AppConfig, brand: BrandConfig, day: date, rng: random.Random) -> list[SlotPlan]:
+def plan_brand_day(app: AppConfig, brand: BrandConfig, day: date, rng: random.Random,
+                   fixed: dict[str, SlotPlan] | None = None) -> list[SlotPlan]:
     spacing = brand.min_slot_spacing_minutes
     if spacing is None:
         spacing = app.settings.scheduler.min_slot_spacing_minutes
-    return compute_day(brand, day, app.settings.tz, prayer_lookup_for(app, brand), rng, spacing)
+    return compute_day(brand, day, app.settings.tz, prayer_lookup_for(app, brand), rng, spacing, fixed=fixed)
+
+
+def slots_fingerprint(app: AppConfig, brand: BrandConfig) -> str:
+    """Changes whenever the brand's slot definitions or spacing change (stored slots are then re-planned)."""
+    spacing = brand.min_slot_spacing_minutes
+    if spacing is None:
+        spacing = app.settings.scheduler.min_slot_spacing_minutes
+    data = {name: slot.model_dump(mode="json") for name, slot in brand.slots.items()}
+    return hashlib.sha1(json.dumps([data, spacing], sort_keys=True).encode()).hexdigest()[:16]

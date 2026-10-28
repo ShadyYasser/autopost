@@ -37,6 +37,12 @@ class FakeContent:
     def remaining(self, brand, stream):
         return {"main": 452, "short": 7, "long": 99}[stream]
 
+    def stream_stats(self, brand, stream, day):
+        if stream != "short":
+            return None
+        return {"received": 5, "received_new": 4, "posted": 4, "queue": 7, "queue_new": 3,
+                "backfill_size": 400, "backfill_done": True, "in_folder": 405}
+
 
 def test_daily_summary_content(app, tmp_path):
     tz = app.settings.tz
@@ -58,6 +64,7 @@ def test_daily_summary_content(app, tmp_path):
     assert "تم التخطي" in text and "18:07" in text
     assert "452 فيديو" in text and "7 فيديو ≈ 2 يوم ⚠️" in text       # Kalima short: 7 left at 3/day
     assert "tiktok_acct 1/100" in text and "✅ 1 منشور" in text
+    assert "وصل اليوم 5 (جديد 4) · نُشر اليوم 4 · في الطابور 7: 3 جديد + 4 من أول 400" in text
 
 
 def test_summary_sent_once_after_its_time(app, tmp_path):

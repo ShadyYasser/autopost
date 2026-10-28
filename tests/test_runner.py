@@ -331,3 +331,35 @@ def test_ffmpeg_installed_only_when_a_post_is_due(app, tmp_path):
     runner.run()
     assert len(calls) == 1 and calls[0][1] == s.target - timedelta(minutes=10)
     assert pub.calls and pub.calls[0][4] >= calls[0][1]
+
+
+def test_schedule_change_replans_only_slots_that_have_not_started(app, tmp_path):
+    from autopost.config import FixedSlot
+
+    kalima = app.brands["kalima_sawaa"]
+    kalima.min_slot_spacing_minutes = 120
+    new_slots = {"morning": FixedSlot(type="fixed", at="10:00", jitter_minutes=45),
+                 "afternoon": FixedSlot(type="fixed", at="14:00", jitter_minutes=45),
+                 "evening": FixedSlot(type="fixed", at="18:30", jitter_minutes=45),
+                 "night": FixedSlot(type="fixed", at="22:00", jitter_minutes=45)}
+    # the schedule as it was: three slots, the old times
+    kalima.slots = {"morning": FixedSlot(type="fixed", at="11:00", jitter_minutes=0),
+                    "afternoon": FixedSlot(type="fixed", at="16:00", jitter_minutes=0),
+                    "night": FixedSlot(type="fixed", at="21:30", jitter_minutes=0)}
+    runner, state, *_ = make(app, tmp_path, at(app, 0, 7), brand="kalima_sawaa")
+    runner.ensure_slots(at(app, 0, 7))
+    state.set_slot_status("kalima_sawaa", TZ_DAY, "morning", "done", at(app, 11, 5))
+    runner.ensure_slots(at(app, 12, 0))                     # same config: nothing moves
+    assert slot(state, "kalima_sawaa", "afternoon").target == at(app, 16, 0)
+
+    kalima.slots = new_slots                                 # 10:00 / 14:00 / 18:30 / 22:00 ±45
+    runner.ensure_slots(at(app, 12, 0))
+    today = {s.slot: s for s in state.slots(brand="kalima_sawaa", days=[TZ_DAY])}
+    assert today["morning"].target == at(app, 11, 0) and today["morning"].status == "done"   # kept
+    for name, (h, m) in {"afternoon": (14, 0), "evening": (18, 30), "night": (22, 0)}.items():
+        assert today[name].status == "scheduled"
+        assert abs((today[name].target - at(app, h, m)).total_seconds()) <= 45 * 60
+    targets = sorted(s.target for s in today.values())
+    assert all(b - a >= timedelta(minutes=120) for a, b in zip(targets, targets[1:]))
+    tomorrow = state.slots(brand="kalima_sawaa", days=[TZ_DAY + timedelta(days=1)])
+    assert [s.slot for s in tomorrow] == ["morning", "afternoon", "evening", "night"]
