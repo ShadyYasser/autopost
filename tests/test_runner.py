@@ -363,3 +363,26 @@ def test_schedule_change_replans_only_slots_that_have_not_started(app, tmp_path)
     assert all(b - a >= timedelta(minutes=120) for a, b in zip(targets, targets[1:]))
     tomorrow = state.slots(brand="kalima_sawaa", days=[TZ_DAY + timedelta(days=1)])
     assert [s.slot for s in tomorrow] == ["morning", "afternoon", "evening", "night"]
+
+
+def test_run_does_not_outlive_max_runtime_waiting_for_slow_checks(app, tmp_path):
+    class SlowCheck(FakePublisher):
+        def publish(self, ctx):
+            super().publish(ctx)
+            if ctx.platform == "tiktok":
+                return Outcome(status="checking", external_id="b1", check_after=self.clock.now() + timedelta(minutes=10))
+            return Outcome(status="sent", external_id="x")
+
+        def check(self, ctx, d):
+            return Outcome(status="checking", external_id="b1", check_after=self.clock.now() + timedelta(minutes=10))
+
+    state = prepare_slots(app, tmp_path, "kalima_sawaa")
+    s = slot(state, "kalima_sawaa", "morning")
+    clock_pub = SlowCheck(None)
+    runner, state, clock, *_ = make(app, tmp_path, s.target, pub=clock_pub, brand="kalima_sawaa", state=state)
+    runner.max_runtime = timedelta(minutes=60)
+    runner.run()
+    assert clock.now() - s.target < timedelta(minutes=75)          # stopped soon after max runtime
+    tiktok = [d for p in state.posts_for_slot("kalima_sawaa", TZ_DAY, "morning") for d in state.deliveries(p["id"])
+              if d.platform == "tiktok"]
+    assert [d.status for d in tiktok] == ["checking"]               # the next run resumes it

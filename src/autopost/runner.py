@@ -430,6 +430,10 @@ class Runner:
             deadline_active = any(c.queue and c.slot.deadline for c in chains)
             items += [(1 if c.slot.deadline else 2, c.ready_at, "chain", c) for c in chains
                       if c.queue and (c.slot.deadline or not deadline_active)]
+            if not accepting:
+                # Past max runtime: finish what is being posted, but leave later status checks to the next
+                # run (it resumes them from state) instead of outliving the job's time limit.
+                items = [i for i in items if i[2] == "chain" or i[1] <= now]
             next_times = [i[1] for i in items]
             if accepting and pending:
                 next_times.append(pending[0].target)

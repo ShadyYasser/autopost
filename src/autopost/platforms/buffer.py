@@ -11,7 +11,7 @@ Every API call is counted per Buffer account in state and checked against the ac
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 
 API = "https://api.buffer.com"
 POLL_STEPS = [60, 60, 90, 120, 180, 240, 300]   # seconds between status checks (last one repeats)
+STUCK_POLL_SECONDS = 600                         # after the normal timeout, while Buffer is still sending
 
 CREATE_POST = """
 mutation($input: CreatePostInput!) {
@@ -32,13 +33,24 @@ mutation($input: CreatePostInput!) {
     ... on MutationError { message }
   }
 }"""
-GET_POST = "query($input: PostInput!) { post(input: $input) { id status sentAt externalLink error { message } } }"
+GET_POST = ("query($input: PostInput!) { post(input: $input) "
+            "{ id status createdAt sentAt externalLink error { message } } }")
 DELETE_POST = """
 mutation($input: DeletePostInput!) {
   deletePost(input: $input) { __typename ... on MutationError { message } }
 }"""
 QUEUED_POSTS = """
 query($input: PostsInput!) { posts(input: $input, first: 50) { edges { node { id status } } } }"""
+
+
+def _age_seconds(created: str | None, now) -> float | None:
+    """Seconds since Buffer created the post (survives restarts, unlike the in-memory poll count)."""
+    if not created:
+        return None
+    try:
+        return (now - datetime.fromisoformat(created.replace("Z", "+00:00"))).total_seconds()
+    except ValueError:
+        return None
 
 
 def channel_matches(channel: dict, wanted: str) -> bool:
@@ -274,10 +286,35 @@ class BufferPublisher:
         if status == "error":
             self._cleanup(asset_id)
             return self.manual(ctx, f"Buffer error: {(p.get('error') or {}).get('message', 'unknown')}")
-        if waited > poll.timeout_minutes * 60:
-            self.cancel(ctx, delivery)
-            return self.manual(ctx, f"not sent after {poll.timeout_minutes} min (status {status})")
-        return self._again(delivery, n)
+        age = _age_seconds(p.get("createdAt"), self.services.now()) or waited
+        if age <= poll.timeout_minutes * 60:
+            return self._again(delivery, n)
+        # Too slow. Remove it from Buffer and hand it over; but a post Buffer is already sending cannot be
+        # deleted, and posting it by hand as well would publish it twice: keep waiting for it instead.
+        if self._delete(cfg.buffer_account, post_id):
+            self._cleanup(asset_id)
+            return self.manual(ctx, f"not sent after {poll.timeout_minutes} min (status {status}); removed from Buffer")
+        minutes = int(age // 60)
+        if age <= poll.stuck_timeout_minutes * 60:
+            self.services.notifier.alert(
+                f"{ctx.brand.name} → {ctx.platform}: Buffer has been sending this post for {minutes} min and it "
+                f"cannot be cancelled. The bot keeps checking for up to {poll.stuck_timeout_minutes} min. "
+                f"Please do not post it by hand yet.",
+                key=f"buffer-stuck:{post_id}", state=self.services.state, now=self.services.now())
+            return Outcome(status="checking", external_id=delivery.external_id, provider="buffer",
+                           check_after=self.services.now() + timedelta(seconds=STUCK_POLL_SECONDS))
+        self._cleanup(asset_id)
+        return self.manual(ctx, f"Buffer still shows '{status}' after {minutes} min. Check {ctx.platform} first: "
+                                f"the post may still appear there")
+
+    def _delete(self, account: str, post_id: str) -> bool:
+        try:
+            self.client(account).delete_post(post_id)
+            log.info("buffer: deleted unsent post %s", post_id)
+            return True
+        except BufferError as exc:
+            log.warning("buffer: could not delete post %s: %s", post_id, exc)
+            return False
 
     def _again(self, delivery, n: int) -> Outcome:
         step = POLL_STEPS[min(n, len(POLL_STEPS) - 1)]

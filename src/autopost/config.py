@@ -123,6 +123,9 @@ class BufferLimits(_Model):
 class BufferPoll(_Model):
     interval_seconds: int = Field(30, ge=5)
     timeout_minutes: int = Field(20, ge=1)
+    # A post Buffer is already sending cannot be deleted: keep checking it (every 10 min) up to this long
+    # before handing it over, so it is not published twice.
+    stuck_timeout_minutes: int = Field(180, ge=1)
 
 
 class BufferAccountConfig(_Model):

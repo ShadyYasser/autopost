@@ -236,3 +236,49 @@ def test_hide_comments_hides_visitor_comments_only(app, tmp_path, monkeypatch):
     # within the interval nothing is swept again
     assert meta.hide_facebook_comments(app, state, Secrets({"META_PAGE_TOKEN_KALIMA": "t"}), notifier,
                                        NOW + timedelta(minutes=5)) == {}
+
+
+def test_slow_post_is_removed_from_buffer_and_handed_over(setup):
+    services, state, notifier, ctx = setup
+    host = FakeHost()
+    created = (NOW - timedelta(minutes=25)).isoformat().replace("+00:00", "Z")
+    s = GraphQLSession([
+        ("post(input", {"post": {"id": "P1", "status": "sending", "createdAt": created}}),
+        ("deletePost", {"deletePost": {"__typename": "DeletePostSuccess"}}),
+    ])
+    pub = BufferPublisher(services, host, session=s)
+    out = pub.check(ctx("takwin", "main", "tiktok", {"text": "t"}), delivery("P1|77"))
+    assert out.status == "manual" and "removed from Buffer" in out.error and host.deleted == ["77"]
+
+
+def test_post_buffer_is_still_sending_is_not_handed_over_twice(setup):
+    services, state, _, ctx = setup
+
+    class TelegramOK:
+        def post(self, url, data=None, files=None, timeout=None):
+            return Resp({"ok": True, "result": {}})
+
+    notifier = services.notifier = Notifier("tok", "chat", session=TelegramOK())
+    host = FakeHost()
+    c = ctx("kalima_sawaa", "short", "tiktok", {"text": "t"})
+    not_allowed = {"deletePost": {"__typename": "NotFoundError", "message": "Account is not allowed to perform this action on post"}}
+
+    def sending(minutes):
+        created = (NOW - timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+        return ("post(input", {"post": {"id": "P1", "status": "sending", "createdAt": created}})
+
+    pub = BufferPublisher(services, host, session=GraphQLSession([sending(25), ("deletePost", not_allowed),
+                                                                  sending(35), ("deletePost", not_allowed)]))
+    first = pub.check(c, delivery("P1|77"))
+    second = pub.check(c, delivery("P1|77"))
+    assert first.status == second.status == "checking" and host.deleted == []
+    assert first.check_after == NOW + timedelta(minutes=10)
+    assert sum("do not post it by hand" in m for m in notifier.sent) == 1          # one alert, not one per check
+
+    pub = BufferPublisher(services, host, session=GraphQLSession([sending(181), ("deletePost", not_allowed)]))
+    last = pub.check(c, delivery("P1|77"))
+    assert last.status == "manual" and "may still appear" in last.error and host.deleted == ["77"]
+
+    pub = BufferPublisher(services, host, session=GraphQLSession([
+        ("post(input", {"post": {"id": "P1", "status": "sent", "externalLink": "https://tiktok.com/v/9"}})]))
+    assert pub.check(c, delivery("P1|77")).status == "sent"
