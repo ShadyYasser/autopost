@@ -5,10 +5,13 @@ enabled: true
 # (see docs/comments.md); YouTube is set in YouTube Studio.
 comments: off
 
+min_slot_spacing_minutes: 120
+
 slots:
-  morning: { type: fixed, at: "11:00", jitter_minutes: 60 }
-  afternoon: { type: fixed, at: "16:00", jitter_minutes: 60 }
-  night: { type: fixed, at: "21:30", jitter_minutes: 60 }
+  morning: { type: fixed, at: "10:00", jitter_minutes: 45 }
+  afternoon: { type: fixed, at: "14:00", jitter_minutes: 45 }
+  evening: { type: fixed, at: "18:30", jitter_minutes: 45 }
+  night: { type: fixed, at: "22:00", jitter_minutes: 45 }
 
 text_source:
   type: filename               # {title} = file name without extension
@@ -25,8 +28,8 @@ text_source:
 streams:
   short:                       # filled by tg2drive (ShadyYasser/tg2drive) from the Telegram group
     drive_folder_id: "1qf_opI5CAtrP5iDn3goNxAZY23rj7Z4c"
-    order: created_time        # upload order = group order; ties by Telegram msg_id
-    slots: [morning, afternoon, night]
+    order: newest_first        # every slot posts the newest unposted reel (highest Telegram msg_id)
+    slots: [morning, afternoon, evening, night]
     backfill:                  # daily-summary stats only: new reels vs the initial 400
       size: 400                # its last msg_id is fixed in state once 400 reels are in the folder
       boundary_msg_id: null    # or set the last backfill msg_id here by hand
@@ -36,7 +39,7 @@ streams:
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
   long:
     drive_folder_id: "1MKCjqE2rKpeT3dGfYtwe7LmYhnZ6CGdP"
-    slots: [night]             # night slot posts BOTH a short and a long video
+    slots: [night]             # the 22:00 slot posts BOTH a short and a long video
     platforms: [youtube, facebook]
     overrides:
       youtube:

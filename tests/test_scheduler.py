@@ -50,15 +50,15 @@ def test_pick_window_is_roughly_fifty_fifty(app):
 def test_kalima_fixed_slots_jitter_and_spacing(app):
     brand = app.brands["kalima_sawaa"]
     rng = random.Random(11)
-    base = {"morning": (11, 0), "afternoon": (16, 0), "night": (21, 30)}
+    base = {"morning": (10, 0), "afternoon": (14, 0), "evening": (18, 30), "night": (22, 0)}
     for i in range(200):
         day = date(2026, 5, 1) + timedelta(days=i)
         plans = plan_brand_day(app, brand, day, rng)
-        assert [p.slot for p in plans] == ["morning", "afternoon", "night"]
+        assert [p.slot for p in plans] == ["morning", "afternoon", "evening", "night"]
         for p in plans:
             h, m = base[p.slot]
             center = p.target.astimezone(app.settings.tz).replace(hour=h, minute=m, second=0)
-            assert abs((p.target - center).total_seconds()) <= 3600
+            assert abs((p.target - center).total_seconds()) <= 45 * 60
             assert p.deadline is None
         gaps = [(b.target - a.target).total_seconds() for a, b in zip(plans, plans[1:])]
-        assert min(gaps) >= 60 * 60
+        assert min(gaps) >= 120 * 60
