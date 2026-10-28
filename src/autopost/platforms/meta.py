@@ -31,9 +31,6 @@ TRANSIENT_CODES = {1, 2, 4, 17, 32, 341, 368, 613, 9007}
 POLL_SECONDS = 15
 MAX_IN_MEMORY = 512 * 1024 * 1024
 POLL_TIMEOUT = timedelta(minutes=25)
-# Instagram's upload server rejects big single-request uploads ("ProcessingFailedError", 0 bytes kept;
-# seen with a 74 MB reel). Above this size Instagram fetches the file from the public media host instead.
-IG_HOSTED_ABOVE_BYTES = 40 * 1024 * 1024
 
 
 class GraphError(Exception):
@@ -92,29 +89,6 @@ class GraphClient:
             return resp.json() if resp.content else {}
         except (requests.RequestException, ValueError):
             return {}
-
-    def rupload_hosted(self, url: str, file_url: str, timeout: int = 300) -> dict:
-        """Let the upload server fetch the video from a public URL (header file_url, no body)."""
-        for attempt in range(1, self.attempts + 1):
-            try:
-                resp = self.session.post(url, headers={**self.headers, "file_url": file_url}, timeout=timeout)
-            except requests.RequestException as exc:
-                if attempt == self.attempts:
-                    raise GraphError(f"upload network error: {type(exc).__name__}", transient=True) from exc
-                time.sleep(5 * attempt)
-                continue
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            if resp.status_code < 400 and "error" not in body and body.get("success", True) is not False:
-                return body
-            err = _graph_error(resp.status_code, body if "error" in body else {"error": {"message": resp.text[:300]}})
-            if resp.status_code >= 500 and attempt < self.attempts:
-                time.sleep(5 * attempt)
-                continue
-            raise err
-        raise GraphError("unreachable")
 
     def rupload(self, url: str, path: Path, timeout: int = 1800, offset: int = 0) -> dict:
         size = path.stat().st_size
@@ -277,39 +251,32 @@ class FacebookPublisher(_MetaBase):
 class InstagramPublisher(_MetaBase):
     def __init__(self, services, host=None):
         super().__init__(services)
-        self.host = host        # public media host (GitHub Release) for big files
+        self.host = host        # public media host (GitHub Release) for the video_url fallback
         self._held: int | None = None
 
-    def _container(self, ctx: PublishContext, g: GraphClient) -> tuple[str, str]:
-        container = g.call("POST", f"{ctx.cfg.ig_user_id}/media", data={
-            "media_type": "REELS", "upload_type": "resumable", "caption": ctx.texts["text"],
-            "share_to_feed": "true"})
-        cid = container["id"]
-        return cid, container.get("uri") or RUPLOAD_IG.format(version=g.version, container=cid)
+    def _container(self, ctx: PublishContext, g: GraphClient, **source) -> dict:
+        return g.call("POST", f"{ctx.cfg.ig_user_id}/media", data={
+            "media_type": "REELS", "caption": ctx.texts["text"], "share_to_feed": "true", **source})
 
     def publish(self, ctx: PublishContext) -> Outcome:
         path = Path(ctx.fetch_video())
         size = path.stat().st_size
         g = self.client(ctx)
         try:
-            cid, uri = self._container(ctx, g)
+            container = self._container(ctx, g, upload_type="resumable")
+            cid = container["id"]
+            uri = container.get("uri") or RUPLOAD_IG.format(version=g.version, container=cid)
         except (GraphError, KeyError) as exc:
             return self.failed(exc)
-        if self.host is not None and size > IG_HOSTED_ABOVE_BYTES:
-            return self._hosted(ctx, g, path, cid, uri)
         try:
             self._upload_with_resume(g, uri, path)
         except GraphError as exc:
             held = self._held
             if held is not None and held < size and self.host is not None:
-                # The server kept none (or part) of the file: this container can never finish.
-                log.warning("instagram: upload server kept %d of %d bytes; letting Instagram fetch the file "
-                            "from the media host instead", held, size)
-                try:
-                    cid, uri = self._container(ctx, g)
-                except (GraphError, KeyError) as exc2:
-                    return self.failed(exc2)
-                return self._hosted(ctx, g, path, cid, uri)
+                # The upload service kept none (or part) of the file, so this container can never finish
+                # (seen during a Meta upload-service outage). Let Instagram fetch it by video_url instead.
+                log.warning("instagram: upload server kept %d of %d bytes; using a video_url container", held, size)
+                return self._by_url(ctx, g, path)
             # rupload can answer "ProcessingFailedError" while Instagram is in fact still processing the
             # file it received (seen with longer videos). The container status is the source of truth.
             st = {}
@@ -328,17 +295,17 @@ class InstagramPublisher(_MetaBase):
         log.info("instagram: uploaded to container %s; waiting for processing", cid)
         return Outcome(status="checking", external_id=str(cid), check_after=self.later(10))
 
-    def _hosted(self, ctx: PublishContext, g: GraphClient, path: Path, cid: str, uri: str) -> Outcome:
-        """Put the file on the public media host and let Instagram fetch it (header file_url)."""
+    def _by_url(self, ctx: PublishContext, g: GraphClient, path: Path) -> Outcome:
+        """Put the file on the public media host and create a container Instagram fills from video_url."""
         asset_id = None
         try:
             url, asset_id = self.host.upload(path, f"{ctx.brand.id}-instagram")
-            g.rupload_hosted(uri, url)
-        except Exception as exc:  # noqa: BLE001 - hosting or upload trouble: retried like any failure
+            cid = self._container(ctx, g, video_url=url)["id"]
+        except Exception as exc:  # noqa: BLE001 - hosting or Graph trouble: retried like any failure
             if asset_id is not None:
                 self.host.delete(asset_id)
-            log.error("instagram hosted upload failed for %s: %s", path.name, exc)
-            return Outcome(status="failed", error=f"instagram hosted upload: {exc}", retryable=True)
+            log.error("instagram video_url upload failed for %s: %s", path.name, exc)
+            return Outcome(status="failed", error=f"instagram video_url upload: {exc}", retryable=True)
         log.info("instagram: container %s fetches %s (%.1f MB); waiting for processing",
                  cid, url, path.stat().st_size / 1_048_576)
         return Outcome(status="checking", external_id=f"{cid}|{asset_id}", check_after=self.later(10))

@@ -327,53 +327,36 @@ class FakeHost:
         self.deleted.append(asset_id)
 
 
-def test_instagram_big_file_is_fetched_from_the_media_host(app, video_file, monkeypatch):
-    import autopost.platforms.meta as meta
-
-    monkeypatch.setattr(meta, "IG_HOSTED_ABOVE_BYTES", 500)          # the 1000-byte test file counts as big
-    services, ctx = make_ctx(app, "kalima_sawaa", "short", "instagram", video_file, {"text": "x"})
-    s = Session([
-        ("POST", "17841411727741746/media", Resp(200, {"id": "C5"})),
-        ("POST", "rupload.facebook.com/ig-api-upload/v26.0/C5", Resp(200, {"success": True})),
-        ("GET", "/C5", Resp(200, {"status_code": "FINISHED"})),
-        ("POST", "17841411727741746/media_publish", Resp(200, {"id": "M5"})),
-        ("GET", "/M5", Resp(200, {"permalink": "https://www.instagram.com/reel/big/"})),
-        ("POST", "/M5", Resp(200, {"success": True})),
-    ])
-    host = FakeHost()
-    pub = InstagramPublisher(services, host)
-    pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
-    out = pub.publish(ctx)
-    assert out.status == "checking" and out.external_id == "C5|55"
-    upload = s.calls[1][2]
-    assert upload["headers"]["file_url"].endswith("/kalima_sawaa-instagram.mp4") and "data" not in upload
-    done = pub.check(ctx, delivery("C5|55"))
-    assert done.status == "sent" and done.url.endswith("/reel/big/") and host.deleted == ["55"]
-
-
-def test_instagram_falls_back_to_the_media_host_when_the_server_keeps_nothing(app, video_file):
+def test_instagram_falls_back_to_video_url_when_the_upload_service_keeps_nothing(app, video_file):
     services, ctx = make_ctx(app, "kalima_sawaa", "short", "instagram", video_file, {"text": "x"})
     failed = Resp(400, {"debug_info": {"retriable": False, "type": "ProcessingFailedError"}})
     routes = [("POST", "17841411727741746/media", Resp(200, {"id": "C6"}))]
     for _ in range(4):                                                 # first try + 3 resumes, all kept 0 bytes
         routes += [("POST", "ig-api-upload/v26.0/C6", failed), ("GET", "ig-api-upload/v26.0/C6", Resp(200, {"offset": 0}))]
     routes += [("POST", "17841411727741746/media", Resp(200, {"id": "C7"})),
-               ("POST", "ig-api-upload/v26.0/C7", Resp(200, {"success": True}))]
+               ("GET", "/C7", Resp(200, {"status_code": "FINISHED"})),
+               ("POST", "17841411727741746/media_publish", Resp(200, {"id": "M7"})),
+               ("GET", "/M7", Resp(200, {"permalink": "https://www.instagram.com/reel/url/"})),
+               ("POST", "/M7", Resp(200, {"success": True}))]
     s = Session(routes)
     host = FakeHost()
     pub = InstagramPublisher(services, host)
     pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
     out = pub.publish(ctx)
-    assert out.status == "checking" and out.external_id == "C7|55"     # fresh container, fetched from the host
-    assert "file_url" in s.calls[-1][2]["headers"]
+    assert out.status == "checking" and out.external_id == "C7|55"     # fresh video_url container
+    create = s.calls[9][2]["data"]
+    assert create["video_url"].endswith("/kalima_sawaa-instagram.mp4") and "upload_type" not in create
+    done = pub.check(ctx, delivery("C7|55"))
+    assert done.status == "sent" and done.url.endswith("/reel/url/") and host.deleted == ["55"]
 
 
-def test_instagram_hosting_failure_is_a_retryable_failure(app, video_file, monkeypatch):
-    import autopost.platforms.meta as meta
-
-    monkeypatch.setattr(meta, "IG_HOSTED_ABOVE_BYTES", 500)
+def test_instagram_hosting_failure_is_a_retryable_failure(app, video_file):
     services, ctx = make_ctx(app, "kalima_sawaa", "short", "instagram", video_file, {"text": "x"})
-    s = Session([("POST", "17841411727741746/media", Resp(200, {"id": "C8"}))])
+    failed = Resp(400, {"debug_info": {"retriable": False, "type": "ProcessingFailedError"}})
+    routes = [("POST", "17841411727741746/media", Resp(200, {"id": "C8"}))]
+    for _ in range(4):
+        routes += [("POST", "ig-api-upload/v26.0/C8", failed), ("GET", "ig-api-upload/v26.0/C8", Resp(200, {"offset": 0}))]
+    s = Session(routes)
     pub = InstagramPublisher(services, FakeHost(fail=True))
     pub._clients[ctx.cfg.token_secret] = GraphClient(TOKEN, "v26.0", s)
     out = pub.publish(ctx)
