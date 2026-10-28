@@ -567,7 +567,8 @@ def cmd_meta_info(args, app: AppConfig) -> int:
     cfg = brand.platforms[platform]
     g = GraphClient(Secrets().get(cfg.token_secret), app.settings.meta.graph_version)
     if platform == "instagram" and args.id.startswith("upload-test:"):
-        return instagram_upload_probe(app, brand, g, args.id.split(":", 1)[1])
+        drive_id, _, modes = args.id.split(":", 1)[1].partition(":")
+        return instagram_upload_probe(app, brand, g, drive_id, set((modes or "chunks,hosted").split(",")))
     fields = ("id,length,permalink_url,published,status,title,description,created_time" if platform == "facebook"
               else "id,media_type,media_product_type,permalink,is_comment_enabled,comments_count,timestamp")
     try:
@@ -579,10 +580,11 @@ def cmd_meta_info(args, app: AppConfig) -> int:
     return 0
 
 
-def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str) -> int:
+def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str, modes: set[str]) -> int:
     """Diagnose Instagram uploads of one Drive video WITHOUT publishing: unpublished containers (they expire
-    after 24 h) are fed the file in 8 MB pieces, by a hosted URL with the redirect resolved, and by the
-    hosted URL as is; then their processing status is reported."""
+    after 24 h) are fed the file in 8 MB pieces ("chunks"), by hosted URL with and without the redirect
+    resolved ("hosted"), re-encoded to the Reels spec ("transcode") or cut to its first 60 s without
+    re-encoding ("trim60"); then their processing status is reported."""
     import time
 
     import requests
@@ -611,10 +613,32 @@ def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str) -> int:
         return r.status_code, r.text[:300]
 
     containers, assets = {}, []
+    variants = {}
+    if "transcode" in modes:
+        forced = path.parent / "forced.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "20", "-profile:v", "high", "-level:v", "4.1", "-pix_fmt", "yuv420p", "-r", "30",
+                        "-g", "60", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+                        "-movflags", "+faststart", str(forced)], check=True)
+        variants["T transcoded"] = forced
+    if "trim60" in modes:
+        trimmed = path.parent / "trim60.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-t", "60", "-c", "copy",
+                        "-movflags", "+faststart", str(trimmed)], check=True)
+        variants["S first 60 s"] = trimmed
+    for label, vpath in variants.items():
+        cid, uri = container(label)
+        containers[label] = cid
+        try:
+            g.rupload(uri, vpath)
+            print(f"{label} ({vpath.stat().st_size / 1_048_576:.1f} MB): uploaded")
+        except GraphError as exc:
+            print(f"{label} ({vpath.stat().st_size / 1_048_576:.1f} MB): upload answered {exc}")
     # A: 8 MB pieces with the offset header
-    cid, uri = container("chunks")
-    containers["A chunks"] = cid
-    step, offset = 8 * 1024 * 1024, 0
+    if "chunks" in modes:
+        cid, uri = container("chunks")
+        containers["A chunks"] = cid
+    step, offset = 8 * 1024 * 1024, (0 if "chunks" in modes else size)
     with path.open("rb") as fh:
         while offset < size:
             fh.seek(offset)
@@ -627,7 +651,9 @@ def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str) -> int:
                 break
             offset += len(chunk)
     # B and C: hosted file, redirect resolved / as is
-    if host is None:
+    if "hosted" not in modes:
+        pass
+    elif host is None:
         print("no media host (GITHUB_TOKEN missing): B and C skipped")
     else:
         url, asset = host.upload(path, f"{brand.id}-igtest")
