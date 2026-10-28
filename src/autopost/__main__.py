@@ -584,7 +584,7 @@ def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str, modes: set[s
     """Diagnose Instagram uploads of one Drive video WITHOUT publishing: unpublished containers (they expire
     after 24 h) are fed the file in 8 MB pieces ("chunks"), by hosted URL with and without the redirect
     resolved ("hosted"), re-encoded to the Reels spec ("transcode") or cut to its first 60 s without
-    re-encoding ("trim60"); then their processing status is reported."""
+    re-encoding ("trim60") or unchanged in one request ("plain"); then their processing status is reported."""
     import time
 
     import requests
@@ -614,6 +614,8 @@ def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str, modes: set[s
 
     containers, assets = {}, []
     variants = {}
+    if "plain" in modes:
+        variants["P unchanged"] = path
     if "transcode" in modes:
         forced = path.parent / "forced.mp4"
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-c:v", "libx264", "-preset", "veryfast",
