@@ -4,7 +4,7 @@ timezone: Africa/Cairo
 
 # Master switch for scheduled (cron) runs. Manual runs (workflow_dispatch) always work.
 # Keep false until the dry run and the one-real-post-per-platform tests pass.
-cron_enabled: false
+cron_enabled: true
 
 # Default location for prayer-relative slots (a brand can override with its own `prayer_times:`).
 prayer_times:
