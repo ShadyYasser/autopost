@@ -18,11 +18,17 @@ from .alerts.telegram import Notifier
 from .clock import RealClock, SimClock
 from .config import AppConfig, ConfigError, load_config, placeholder_values
 from .content.base import PlaceholderContent
-from .content.drive_source import ContentError, DriveContent, choose_next_row, format_ranges, numbering_report
+from .content.drive_source import (
+    ContentError,
+    DriveContent,
+    choose_next_row,
+    format_ranges,
+    numbering_report,
+)
 from .content.google_api import GoogleClient, GoogleError, session_from_service_account
 from .content.text import render
-from .platforms.base import DryRunPublisher
 from .media import ensure_ffmpeg
+from .platforms.base import DryRunPublisher
 from .prayer import PrayerCalculator
 from .runner import Runner
 from .scheduler import ScheduleError, plan_brand_day
@@ -324,6 +330,12 @@ def cmd_sources(args, app: AppConfig) -> int:
                     print(f"   backfill: {'complete' if stats['backfill_done'] else 'in progress'} "
                           f"({stats['in_folder']}/{stats['backfill_size']} Telegram reels in the folder); "
                           f"queue {stats['queue']} ({stats['queue_new']} new); received today {stats['received']}")
+                if stream.order == "name_number":
+                    rep = numbering_report(listing)
+                    print(f"   numbering: {rep['count']} numbered files, {rep['first']} → {rep['last']}; "
+                          f"missing: {format_ranges(rep['gaps']) or 'none'}; "
+                          f"duplicates: {'; '.join(f'{n}: ' + ', '.join(v) for n, v in rep['duplicates'].items()) or 'none'}; "
+                          f"unnumbered: {', '.join(rep['unnumbered']) or 'none'}")
                 groups = [("", unused)]
                 cursor = state.caption_cursor(brand.id)
                 shown_videos = [(label, i, v) for label, vids in groups for i, v in enumerate(vids[: args.count])]
@@ -554,6 +566,8 @@ def cmd_meta_info(args, app: AppConfig) -> int:
     platform = "facebook" if args.platform == "facebook" else "instagram"
     cfg = brand.platforms[platform]
     g = GraphClient(Secrets().get(cfg.token_secret), app.settings.meta.graph_version)
+    if platform == "instagram" and args.id.startswith("upload-test:"):
+        return instagram_upload_probe(app, brand, g, args.id.split(":", 1)[1])
     fields = ("id,length,permalink_url,published,status,title,description,created_time" if platform == "facebook"
               else "id,media_type,media_product_type,permalink,is_comment_enabled,comments_count,timestamp")
     try:
@@ -562,6 +576,90 @@ def cmd_meta_info(args, app: AppConfig) -> int:
         print(f"✗ {exc}", file=sys.stderr)
         return 1
     print(json.dumps(data, ensure_ascii=False, indent=2))
+    return 0
+
+
+def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str) -> int:
+    """Diagnose Instagram uploads of one Drive video WITHOUT publishing: unpublished containers (they expire
+    after 24 h) are fed the file in 8 MB pieces, by a hosted URL with the redirect resolved, and by the
+    hosted URL as is; then their processing status is reported."""
+    import time
+
+    import requests
+
+    from .hosting.github_release import GitHubReleaseHost
+    from .platforms.meta import RUPLOAD_IG, GraphError
+
+    ensure_ffmpeg()
+    secrets = Secrets()
+    state, tmpdir = open_state(ROOT / "state" / "state.db", throwaway=True)
+    content = make_content(app, state, secrets, dry_run=True)
+    video = content.client.get_video(drive_id)
+    path = Path(content.fetch(video))
+    size = path.stat().st_size
+    print(f"video {video.name}: {size / 1_048_576:.1f} MB, {content.probe(video).describe()}")
+    host = GitHubReleaseHost.from_env(app.settings.media_hosting.github_release_tag)
+    ig = brand.platforms["instagram"].ig_user_id
+
+    def container(label):
+        c = g.call("POST", f"{ig}/media", data={"media_type": "REELS", "upload_type": "resumable",
+                                                "caption": f"upload test ({label}), not published"})
+        return c["id"], c.get("uri") or RUPLOAD_IG.format(version=g.version, container=c["id"])
+
+    def post(uri, headers, data=None):
+        r = g.session.post(uri, headers={**g.headers, **headers}, data=data, timeout=600)
+        return r.status_code, r.text[:300]
+
+    containers, assets = {}, []
+    # A: 8 MB pieces with the offset header
+    cid, uri = container("chunks")
+    containers["A chunks"] = cid
+    step, offset = 8 * 1024 * 1024, 0
+    with path.open("rb") as fh:
+        while offset < size:
+            fh.seek(offset)
+            chunk = fh.read(step)
+            code, text = post(uri, {"offset": str(offset), "file_size": str(size),
+                                    "Content-Type": "application/octet-stream"}, chunk)
+            held = g.rupload_status(uri)
+            print(f"A chunk at {offset}: HTTP {code} {text[:160]} | server holds {held}")
+            if code >= 400:
+                break
+            offset += len(chunk)
+    # B and C: hosted file, redirect resolved / as is
+    if host is None:
+        print("no media host (GITHUB_TOKEN missing): B and C skipped")
+    else:
+        url, asset = host.upload(path, f"{brand.id}-igtest")
+        assets.append(asset)
+        loc = requests.get(url, allow_redirects=False, stream=True, timeout=60).headers.get("Location")
+        print(f"hosted at {url}\n  redirects to {loc[:120] + '…' if loc else 'nothing'}")
+        for label, file_url in (("B resolved", loc), ("C as-is", url)):
+            if not file_url:
+                continue
+            cid, uri = container(label)
+            containers[label] = cid
+            code, text = post(uri, {"file_url": file_url})
+            print(f"{label}: HTTP {code} {text[:200]}")
+    # processing status (nothing is published)
+    for _ in range(16):
+        time.sleep(15)
+        line = []
+        for label, cid in containers.items():
+            try:
+                st = g.call("GET", cid, params={"fields": "status_code,status"})
+                line.append(f"{label}={st.get('status_code')} ({st.get('status')})")
+            except GraphError as exc:
+                line.append(f"{label}=error {exc}")
+        print(" | ".join(line))
+        if all("IN_PROGRESS" not in x for x in line):
+            break
+    for a in assets:
+        host.delete(a)
+    content.release(video)
+    state.close()
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    print("containers are left unpublished and expire on their own")
     return 0
 
 
