@@ -99,6 +99,7 @@ def test_slash_restored_other_characters_kept(app, tmp_path):
 
 
 def test_posts_of_deleted_files_do_not_change_counts(app, tmp_path):
+    app.brands["kalima_sawaa"].streams["short"].order = "created_time"
     content, state, client = make(app, tmp_path)
     for old in ("deleted-1", "deleted-2", "deleted-3"):
         post(state, old)
