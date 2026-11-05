@@ -86,7 +86,7 @@ def setup(app, tmp_path):
 
 ACCOUNT = {"account": {"email": "e", "organizations": [{"id": "ORG", "name": "o"}]}}
 CHANNELS = {"channels": [{"id": "CH_TAK", "name": "_takwen", "displayName": "_takwen", "service": "tiktok"},
-                         {"id": "CH_KAL", "name": "kalima_sawaa", "displayName": "kalima_sawaa", "service": "tiktok"}]}
+                         {"id": "CH_KAL", "name": "kalima.sawaa.official", "displayName": "kalima.sawaa.official", "service": "tiktok"}]}
 YT_CHANNELS = {"channels": [{"id": "YT_TAK", "name": "TAKWEN تكوين ", "displayName": "TAKWEN تكوين ", "service": "youtube"}]}
 
 

@@ -69,7 +69,7 @@ platforms:
   tiktok:
     provider: buffer
     buffer_account: tiktok_acct
-    channel: "kalima_sawaa"
+    channel: "kalima.sawaa.official"
   youtube:
     provider: buffer
     buffer_account: youtube_acct
