@@ -32,6 +32,7 @@ from .google_api import GoogleClient, GoogleError, a1_sheet, natural_key
 from .text import title_from_filename
 from ..title_guard import (AnthropicBackend, AudioVerdict, GuardError, LocalBackend, OpenAICompatBackend,
                            TitleGuard, Verdict)
+from ..title_guard import MAX_TRANSCRIPT
 from ..transcribe import TranscribeError, Transcriber, WhisperSettings
 
 log = logging.getLogger(__name__)
@@ -230,7 +231,7 @@ class DriveContent:
     def unused(self, brand: str, stream: str) -> list[VideoItem]:
         used = self.state.used_source_ids(brand, stream)
         return [v for v in self.listing(brand, stream)
-                if v.id not in used and not self.skipped_title(brand, stream, v) and not self.held_back(brand, v)]
+                if v.id not in used and not self.skipped_title(brand, stream, v) and not self.held_back(brand, v, stream)]
 
     # ------------------------------------------------------------ title check
 
@@ -283,8 +284,10 @@ class DriveContent:
                  "; ".join(verdict.reasons))
         return verdict
 
-    def held_back(self, brand: str, video: VideoItem) -> bool:
-        """True when this video's cached title check says it must not be posted (never calls the API)."""
+    def held_back(self, brand: str, video: VideoItem, stream: str | None = None) -> bool:
+        """True when the cached checks say this video must not be posted (never calls a model). A title that is
+        blocked on its own stays in the queue when the stream has the audio check: `screen` checks the speech and
+        writes a replacement title from the transcript."""
         cfg = self.app.brands[brand].title_guard
         if cfg is None or not cfg.enabled or not isinstance(self.app.brands[brand].text_source, FilenameTextSource):
             return False
@@ -292,7 +295,11 @@ class DriveContent:
         if raw:
             try:
                 if Verdict.from_json(raw).risk in cfg.block_levels:
-                    return True
+                    if not (stream and self.audio_on(brand, stream)):
+                        return True
+                    new = self.cached_retitle(brand, video)
+                    if new is not None and new.risk in cfg.block_levels:
+                        return True            # no clean title possible; with none yet, screen() writes it
             except (ValueError, KeyError):
                 pass
         raw = self.state.kv_get(self._audio_key(brand, video))
@@ -308,6 +315,13 @@ class DriveContent:
     def _audio_key(self, brand: str, video: VideoItem) -> str:
         """Like the title key: renaming the file checks the video again (the way to override a false alarm)."""
         return self._guard_key(brand, video)[0].replace("guard:", "audio:", 1)
+
+    def _retitle_key(self, brand: str, video: VideoItem) -> str:
+        # `guard:` / `audio:` prefixes: the prescreen job's state merge already lets those win
+        return self._guard_key(brand, video)[0].replace("guard:", "guard:retitle:", 1)
+
+    def _text_key(self, brand: str, video: VideoItem) -> str:
+        return self._guard_key(brand, video)[0].replace("guard:", "audio:text:", 1)
 
     def audio_on(self, brand: str, stream: str) -> bool:
         cfg = self.app.brands[brand].title_guard
@@ -332,27 +346,100 @@ class DriveContent:
         except (ValueError, KeyError):
             return None
 
-    def audio_verdict(self, brand: str, stream: str, video: VideoItem) -> AudioVerdict:
-        """What is said in the video, judged (cached in state). Downloads the original, transcribes the first
-        seconds, deletes the download. Any failure raises ContentError: nothing is posted, the next run retries."""
-        cached = self.cached_audio(brand, video)
+    def transcript(self, brand: str, video: VideoItem) -> str:
+        """What is said in the first seconds of the video (cached in state, so a failed later step never costs
+        a second transcription). Downloads the original, transcribes it, deletes the download."""
+        key = self._text_key(brand, video)
+        cached = self.state.kv_get(key)
         if cached is not None:
             return cached
-        guard = self.guard_for(brand)
         suffix = Path(video.name).suffix.lower() or ".mp4"
         dest = self.work_dir / f"{video.id}.screen{suffix}"
         try:
             log.info("audio check: downloading %s (%s)", video.name, _size(video.size))
             self.client.download(video.id, dest, video.size)
             text = self.transcriber_for(brand).transcribe(dest, self.work_dir)
-            verdict = guard.judge_audio(self._guard_key(brand, video)[1], text)
-        except (GoogleError, TranscribeError, GuardError) as exc:
+        except (GoogleError, TranscribeError) as exc:
             raise ContentError(f"{video.name}: audio check failed: {exc}") from exc
         finally:
             dest.unlink(missing_ok=True)
+        text = " ".join(text.split())[:MAX_TRANSCRIPT]
+        self.state.kv_set(key, text)
+        return text
+
+    def audio_verdict(self, brand: str, stream: str, video: VideoItem) -> AudioVerdict:
+        """What is said in the video, judged (cached in state). Any failure raises ContentError: nothing is
+        posted, the next run retries."""
+        cached = self.cached_audio(brand, video)
+        if cached is not None:
+            return cached
+        text = self.transcript(brand, video)
+        try:
+            verdict = self.guard_for(brand).judge_audio(self._guard_key(brand, video)[1], text)
+        except GuardError as exc:
+            raise ContentError(f"{video.name}: audio check failed: {exc}") from exc
         self.state.kv_set(self._audio_key(brand, video), verdict.to_json())
         log.info("audio check %s [%s]: %s", video.name, verdict.risk, "; ".join(verdict.reasons))
         return verdict
+
+    def cached_retitle(self, brand: str, video: VideoItem) -> Verdict | None:
+        raw = self.state.kv_get(self._retitle_key(brand, video))
+        if not raw:
+            return None
+        try:
+            return Verdict.from_json(raw)
+        except (ValueError, KeyError):
+            return None
+
+    def retitle(self, brand: str, video: VideoItem) -> Verdict:
+        """A clean replacement for a title that cannot be posted, from the title's neutral core or from the
+        transcript (cached in state)."""
+        cached = self.cached_retitle(brand, video)
+        if cached is not None:
+            return cached
+        title = self._guard_key(brand, video)[1]
+        try:
+            new = self.guard_for(brand).retitle(title, self.transcript(brand, video))
+        except GuardError as exc:
+            raise ContentError(f"{video.name}: retitle failed: {exc}") from exc
+        self.state.kv_set(self._retitle_key(brand, video), new.to_json())
+        log.info("retitle %s [%s]: %r → %r (%s)", video.name, new.risk, title, new.title, "; ".join(new.reasons))
+        return new
+
+    def screen(self, brand: str, stream: str, video: VideoItem) -> tuple[str, str, str, tuple[str, ...]] | None:
+        """Run every check this stream has. None: the video may be posted (a blocked title is replaced by a new
+        one, see `retitle`). Otherwise (what, risk, text to show, reasons) of the check that holds it back."""
+        cfg = self.app.brands[brand].title_guard
+        verdict = self.verdict(brand, video)
+        if verdict is None:
+            return None
+        title_blocked = verdict.risk in cfg.block_levels
+        if not self.audio_on(brand, stream):
+            return ("title", verdict.risk, verdict.original, verdict.reasons) if title_blocked else None
+        heard = self.audio_verdict(brand, stream, video)
+        if heard.risk in cfg.block_levels:
+            return ("audio", heard.risk, heard.excerpt, heard.reasons)
+        if title_blocked:
+            new = self.retitle(brand, video)
+            if new.risk in cfg.block_levels:
+                return ("title", new.risk, verdict.original, new.reasons or verdict.reasons)
+        return None
+
+    def checked(self, brand: str, stream: str, video: VideoItem) -> bool:
+        """True when every check of this stream already has its cached result (no model call needed)."""
+        cfg = self.app.brands[brand].title_guard
+        raw = self.state.kv_get(self._guard_key(brand, video)[0])
+        if raw is None:
+            return False
+        if not self.audio_on(brand, stream):
+            return True
+        if self.cached_audio(brand, video) is None:
+            return False
+        try:
+            blocked = Verdict.from_json(raw).risk in cfg.block_levels
+        except (ValueError, KeyError):
+            return False
+        return not blocked or self.cached_retitle(brand, video) is not None
 
     def _alert_hold(self, brand: str, stream: str, video: VideoItem, what: str, risk: str, shown: str,
                     reasons: tuple[str, ...]) -> None:
@@ -428,19 +515,15 @@ class DriveContent:
         fresh = 0
         for video in pending[: self.GUARD_LOOKAHEAD]:
             verdict = self.verdict(brand, video)          # a model failure raises: nothing is posted (fail closed)
-            if verdict is not None and verdict.risk in cfg.block_levels:
-                self._alert_hold(brand, stream, video, "title", verdict.risk, verdict.original, verdict.reasons)
+            if audio and verdict is not None and self.cached_audio(brand, video) is None:
+                if fresh >= self.AUDIO_FRESH_LIMIT:
+                    raise ContentError(f"{self.AUDIO_FRESH_LIMIT} videos in a row were held back by the audio "
+                                       f"check; the next run continues with the following ones")
+                fresh += 1
+            held = self.screen(brand, stream, video)
+            if held:
+                self._alert_hold(brand, stream, video, *held)
                 continue
-            if audio and verdict is not None:
-                if self.cached_audio(brand, video) is None:
-                    if fresh >= self.AUDIO_FRESH_LIMIT:
-                        raise ContentError(f"{self.AUDIO_FRESH_LIMIT} videos in a row were held back by the audio "
-                                           f"check; the next run continues with the following ones")
-                    fresh += 1
-                heard = self.audio_verdict(brand, stream, video)
-                if heard.risk in cfg.block_levels:
-                    self._alert_hold(brand, stream, video, "audio", heard.risk, heard.excerpt, heard.reasons)
-                    continue
             return dataclasses.replace(video)
         raise ContentError(f"the next {self.GUARD_LOOKAHEAD} videos were all held back by the title/audio check")
 
@@ -452,23 +535,13 @@ class DriveContent:
         cfg = self.app.brands[brand].title_guard
         if cfg is None or not cfg.enabled or self.guard_for(brand) is None:
             return stats
-        audio = self.audio_on(brand, stream)
         for video in self.unused(brand, stream)[:limit]:
             if deadline is not None and time.monotonic() >= deadline:
                 break
-            before = (self.state.kv_get(self._guard_key(brand, video)[0]) is not None,
-                      not audio or self.cached_audio(brand, video) is not None)
-            if all(before):
+            if self.checked(brand, stream, video):
                 stats["already"] += 1
                 continue
-            verdict = self.verdict(brand, video)
-            held = None
-            if verdict is not None and verdict.risk in cfg.block_levels:
-                held = ("title", verdict.risk, verdict.original, verdict.reasons)
-            elif audio:
-                heard = self.audio_verdict(brand, stream, video)
-                if heard.risk in cfg.block_levels:
-                    held = ("audio", heard.risk, heard.excerpt, heard.reasons)
+            held = self.screen(brand, stream, video)
             stats["checked"] += 1
             if held:
                 stats["held"] += 1
@@ -575,6 +648,12 @@ class DriveContent:
             verdict = self.verdict(brand, video)
             if verdict is not None:
                 title = verdict.title
+                cfg = self.app.brands[brand].title_guard
+                if verdict.risk in cfg.block_levels:           # only reached with a clean replacement title
+                    new = self.cached_retitle(brand, video) if self.audio_on(brand, stream) else None
+                    if new is None or new.risk in cfg.block_levels:
+                        raise ContentError(f"{video.name}: the title is blocked and has no replacement")
+                    title = new.title
             return TextChoice(variables={"title": title})
         row = choose_next_row(self.sheet_rows(brand), self.state.caption_cursor(brand), src.start_row)
         return TextChoice(variables=dict(row.values), row=row.number)

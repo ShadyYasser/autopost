@@ -93,6 +93,34 @@ Reply with ONLY one JSON object, no other text:
 {{"risk": "low|medium|high", "reasons": ["<short English reason; for high, include the exact Arabic words>", ...]}}"""
 
 
+RETITLE_SYSTEM_PROMPT = """You write titles for short Arabic reels on the channel "كلمة سواء": an educational, \
+interfaith-dialogue page (Islam, Christianity and comparative religion) that reposts reels made by others with \
+permission. The title is used as the caption on TikTok, Instagram, Facebook and YouTube Shorts, so it must follow \
+those platforms' community rules.
+{context}
+The original title of this reel cannot be posted: it insults, mocks or generalizes about people or a religion, or is \
+shock-bait. The speech of the reel was checked separately and is acceptable. You get one JSON object: \
+{{"original_title": "...", "transcript": "..."}}; the transcript is automatic speech-to-text of spoken Arabic and can \
+contain recognition mistakes.
+
+Write a NEW title (Arabic, same dialect and register as the original, at most 100 characters):
+- If the original title has a clear neutral core (the speaker's or guest's name, the book, the verse, the question), \
+keep that core and drop the insult, the mockery, the shock words, the emojis and the generalizations.
+- If the original title says nothing usable, take the topic from the transcript: what is actually discussed or asked.
+- Prefer a calm descriptive form: a question, "قراءة في ...", "رد على ...", "مناقشة ...". Criticizing an idea or a \
+claim is fine; demeaning people or a group is not.
+- Use only names, books, verses and claims that appear in the original title or in the transcript. Never add facts. \
+Never say what the transcript does not say.
+- Write words normally: no dots, dashes or elongation letters placed inside words.
+
+Risk: "low" when you wrote a clean title that honestly describes the reel; "high" when no honest, clean title is \
+possible (the transcript is empty or unclear and the title has no usable core, or the whole point of the reel is to \
+demean someone).
+
+Reply with ONLY one JSON object, no other text:
+{{"title": "<new title>", "risk": "low|high", "reasons": ["<short English note on where the title came from>", ...]}}"""
+
+
 class GuardError(Exception):
     pass
 
@@ -189,6 +217,20 @@ def parse_reply(text: str, original: str) -> Verdict:
         raise GuardError("the model returned an empty title")
     if risk == "low":
         return Verdict(original, risk, reasons, original)          # low = unchanged, whatever it returned
+    return Verdict(cut_words(title, MAX_TITLE), risk, reasons, original)
+
+
+def parse_retitle_reply(text: str, original: str) -> Verdict:
+    data = _json_object(text)
+    risk = str(data.get("risk", "")).lower()
+    if risk not in ("low", "high"):
+        raise GuardError(f"unknown risk {data.get('risk')!r}")
+    reasons = tuple(str(r)[:200] for r in (data.get("reasons") or [])[:5])
+    title = clean_obfuscation(" ".join(str(data.get("title") or "").split()))
+    if risk == "high":
+        return Verdict(title or original, risk, reasons, original)
+    if not title:
+        raise GuardError("the model returned an empty title")
     return Verdict(cut_words(title, MAX_TITLE), risk, reasons, original)
 
 
@@ -293,6 +335,7 @@ class TitleGuard:
         ctx = (context.strip() + "\n") if context.strip() else ""
         self.system = SYSTEM_PROMPT.format(context=ctx)
         self.audio_system = AUDIO_SYSTEM_PROMPT.format(context=ctx)
+        self.retitle_system = RETITLE_SYSTEM_PROMPT.format(context=ctx)
         self.sleep, self.attempts = sleep, attempts
 
     def _ask(self, system: str, user: str, max_tokens: int, what: str) -> str:
@@ -312,6 +355,15 @@ class TitleGuard:
         original = clean_obfuscation(title)
         text = self._ask(self.system, json.dumps({"title": original}, ensure_ascii=False), 500, "title check")
         return parse_reply(text, original)
+
+    def retitle(self, original_title: str, transcript: str) -> Verdict:
+        """A new, clean title for a reel whose own title cannot be posted: from the title's neutral core when it
+        has one, otherwise from what is said. risk "high" = no honest clean title is possible."""
+        original = clean_obfuscation(original_title)
+        payload = json.dumps({"original_title": original, "transcript": " ".join(transcript.split())[:MAX_TRANSCRIPT]},
+                             ensure_ascii=False)
+        text = self._ask(self.retitle_system, payload, 500, "retitle")
+        return parse_retitle_reply(text, original)
 
     def judge_audio(self, title: str, transcript: str) -> AudioVerdict:
         """Risk of what is said in the reel. An empty transcript (music, silence) is low risk without a model call."""

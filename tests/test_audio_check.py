@@ -35,11 +35,15 @@ class Scripted:
     """A fake model backend: titles are low risk unless listed; a transcript containing a key of `audio` gets
     that verdict."""
 
-    def __init__(self, titles=None, audio=None):
-        self.titles, self.audio, self.calls = titles or {}, audio or {}, []
+    def __init__(self, titles=None, audio=None, retitles=None):
+        self.titles, self.audio, self.retitles, self.calls = titles or {}, audio or {}, retitles or {}, []
 
     def complete(self, system, user, max_tokens=500):
         data = json.loads(user)
+        if "original_title" in data:
+            self.calls.append(("retitle", data["original_title"], data["transcript"]))
+            return json.dumps(self.retitles.get(data["original_title"], {
+                "title": "قراءة في الموضوع", "risk": "low", "reasons": ["from the transcript"]}))
         if "transcript" in data:
             self.calls.append(("audio", data["transcript"]))
             for needle, verdict in self.audio.items():
@@ -102,11 +106,71 @@ def test_high_risk_speech_holds_the_video_back_and_the_next_one_is_used(app, tmp
     assert transcriber.calls == ["m3", "m2"]
 
 
-def test_a_title_held_back_is_never_downloaded(app, tmp_path):
-    content, _, client, backend, transcriber, _ = setup(app, tmp_path)
+def test_a_blocked_title_gets_a_new_title_from_the_transcript_when_the_speech_is_fine(app, tmp_path):
+    content, state, _, backend, transcriber, alerts = setup(app, tmp_path)
+    backend.titles["عنوان 3"] = {"title": "", "risk": "high", "reasons": ["insult"]}
+    video = content.next_video("kalima_sawaa", "short")
+    assert video.id == "m3" and transcriber.calls == ["m3"] and not alerts
+    assert ("retitle", "عنوان 3", CALM) in backend.calls
+    assert content.pick_text("kalima_sawaa", "short", video).variables["title"] == "قراءة في الموضوع"
+    # everything is cached: no second transcription, no second model call, and the filter lets it through
+    before = len(backend.calls)
+    assert content.next_video("kalima_sawaa", "short").id == "m3"
+    assert transcriber.calls == ["m3"] and len(backend.calls) == before
+    assert not content.held_back("kalima_sawaa", video, "short")
+    assert content.checked("kalima_sawaa", "short", video)
+
+
+def test_a_blocked_title_with_a_violating_speech_stays_held_and_is_not_retitled(app, tmp_path):
+    content, _, _, backend, transcriber, alerts = setup(app, tmp_path, texts={"m3": INSULT})
     backend.titles["عنوان 3"] = {"title": "", "risk": "high", "reasons": ["insult"]}
     assert content.next_video("kalima_sawaa", "short").id == "m2"
-    assert transcriber.calls == ["m2"]
+    assert [c[0] for c in backend.calls].count("retitle") == 0
+    assert len(alerts) == 1 and "audio" in alerts[0][0]
+
+
+def test_when_no_clean_title_is_possible_the_video_is_held(app, tmp_path):
+    content, _, _, backend, _, alerts = setup(app, tmp_path)
+    backend.titles["عنوان 3"] = {"title": "", "risk": "high", "reasons": ["insult"]}
+    backend.retitles["عنوان 3"] = {"title": "", "risk": "high", "reasons": ["transcript unclear"]}
+    assert content.next_video("kalima_sawaa", "short").id == "m2"
+    assert "title check (high)" in alerts[0][0]
+    assert content.held_back("kalima_sawaa", next(v for v in content.listing("kalima_sawaa", "short") if v.id == "m3"),
+                             "short")
+
+
+def test_a_retitle_model_failure_does_not_cost_a_second_transcription(app, tmp_path):
+    content, state, _, backend, transcriber, _ = setup(app, tmp_path)
+    backend.titles["عنوان 3"] = {"title": "", "risk": "high", "reasons": ["insult"]}
+    complete = backend.complete
+
+    def fails_on_retitle(system, user, max_tokens=500):
+        if "original_title" in json.loads(user):
+            raise BackendError("HTTP 500", retryable=True)
+        return complete(system, user, max_tokens)
+
+    backend.complete = fails_on_retitle
+    content.guard_for("kalima_sawaa").sleep = lambda s: None
+    with pytest.raises(ContentError, match="retitle failed"):
+        content.next_video("kalima_sawaa", "short")
+    backend.complete = complete
+    assert content.next_video("kalima_sawaa", "short").id == "m3"
+    assert transcriber.calls == ["m3"]                                    # the transcript was cached
+
+
+def test_prescreen_retitles_and_counts_it_as_checked(app, tmp_path):
+    content, _, _, backend, _, alerts = setup(app, tmp_path, n=2)
+    backend.titles["عنوان 2"] = {"title": "", "risk": "high", "reasons": ["insult"]}
+    assert content.prescreen("kalima_sawaa", "short", 4) == {"checked": 2, "held": 0, "already": 0}
+    assert content.prescreen("kalima_sawaa", "short", 4) == {"checked": 0, "held": 0, "already": 2}
+    assert not alerts
+
+
+def test_a_stream_without_the_audio_check_still_holds_a_blocked_title(app, tmp_path):
+    content, _, _, backend, transcriber, alerts = setup(app, tmp_path, audio=AudioCheckConfig(streams=["long"]))
+    backend.titles["عنوان 3"] = {"title": "", "risk": "high", "reasons": ["insult"]}
+    assert content.next_video("kalima_sawaa", "short").id == "m2"
+    assert transcriber.calls == [] and "title check (high)" in alerts[0][0]
 
 
 def test_transcription_failure_posts_nothing_and_caches_nothing(app, tmp_path):
