@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -50,6 +51,24 @@ def extract_audio(src: Path, out: Path, seconds: int, timeout: int = 300) -> Pat
     return out
 
 
+def read_wav(path: Path):
+    """16 kHz mono 16-bit wav -> float32 numpy array in [-1, 1].
+
+    Whisper gets the samples directly: faster-whisper's own file decoder goes through PyAV, whose newer releases
+    broke it (`open() got an unexpected keyword argument 'metadata_errors'`), and our ffmpeg step already produced
+    exactly the format Whisper wants."""
+    import numpy as np  # installed together with faster-whisper / ctranslate2
+
+    try:
+        with wave.open(str(path), "rb") as w:
+            if w.getsampwidth() != 2 or w.getnchannels() != 1:
+                raise TranscribeError(f"unexpected audio format: {w.getnchannels()}ch/{8 * w.getsampwidth()}bit")
+            frames = w.readframes(w.getnframes())
+    except wave.Error as exc:
+        raise TranscribeError(f"cannot read extracted audio: {exc}") from exc
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 class Transcriber:
     def __init__(self, settings: WhisperSettings | None = None, model_factory: Callable[[WhisperSettings], object] | None = None):
         self.settings = settings or WhisperSettings()
@@ -80,7 +99,7 @@ class Transcriber:
                 self._model = self._factory(s)
             try:
                 segments, _info = self._model.transcribe(
-                    str(wav), language=s.language, beam_size=s.beam_size, vad_filter=True,
+                    read_wav(wav), language=s.language, beam_size=s.beam_size, vad_filter=True,
                     condition_on_previous_text=False)
                 text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
             except TranscribeError:

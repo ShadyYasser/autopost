@@ -369,7 +369,7 @@ def test_transcriber_joins_segments_loads_once_and_removes_the_wav(tmp_path):
     class Model:
         def transcribe(self, path, **kw):
             seen.update(kw)
-            seen["exists"] = path.endswith(".wav") and __import__("os").path.exists(path)
+            seen["exists"] = getattr(path, "dtype", None) is not None and path.dtype.name == "float32" and len(path) > 1000
             return iter([Seg(" مرحبا  بكم "), Seg(""), Seg("في الحلقة")]), object()
 
     loads = []
