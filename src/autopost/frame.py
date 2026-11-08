@@ -1,0 +1,180 @@
+"""Branded frame around a reel: logo bar on top, source credit at the bottom, the video in between.
+
+The static layer (cream background, logo, credit line, a gold rounded border and a transparent
+hole exactly the size of the scaled video) is drawn once per video with Pillow, then ffmpeg scales
+the video into the hole and overlays the layer in a single re-encode pass. The output already
+matches the upload spec (H.264 + AAC, yuv420p, constant fps, +faststart).
+"""
+
+from __future__ import annotations
+
+import logging
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from .media import MediaInfo, TranscodeError
+
+log = logging.getLogger(__name__)
+
+SUPERSAMPLE = 4
+
+
+@dataclass(frozen=True)
+class FrameStyle:
+    width: int = 1080
+    height: int = 1920
+    top_bar: int = 270               # room for the logo
+    bottom_bar: int = 130            # room for the credit line
+    side_margin: int = 30            # minimum cream margin left/right of the video
+    radius: int = 40                 # rounded corners of the video window
+    border: int = 5                  # gold line around the window
+    bg: str = "#fbf6ed"              # same cream as the logo's own background
+    navy: str = "#092e48"
+    gold: str = "#a47a3c"
+    logo: Path | None = None
+    credit: str | None = None
+    font: Path | None = None
+    fps: int = 30
+    crf: int = 18
+    preset: str = "veryfast"
+    audio_bitrate: str = "160k"
+
+
+def _even(n: float) -> int:
+    return max(2, int(n) // 2 * 2)
+
+
+def video_rect(style: FrameStyle, vw: int, vh: int) -> tuple[int, int, int, int]:
+    """(x, y, w, h) of the video window: the source fitted into the area between the bars."""
+    area_w = style.width - 2 * style.side_margin
+    area_h = style.height - style.top_bar - style.bottom_bar
+    scale = min(area_w / vw, area_h / vh)
+    w, h = _even(vw * scale), _even(vh * scale)
+    x = (style.width - w) // 2 // 2 * 2
+    y = (style.top_bar + (area_h - h) // 2) // 2 * 2
+    return x, y, w, h
+
+
+def _draw_arabic(draw, xy, text: str, font, fill, anchor_width: int | None = None) -> tuple[int, int]:
+    """Draw right-to-left text. Pillow with libraqm shapes and orders Arabic itself; without it the
+    letters are joined with arabic_reshaper and reordered with python-bidi first. Returns (w, h)."""
+    from PIL import features
+
+    if features.check("raqm"):
+        kw = {"direction": "rtl", "language": "ar"}
+    else:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        from PIL import ImageFont
+
+        # visual-order text drawn left to right: the basic layout engine must not reorder it a second time
+        font = ImageFont.truetype(font.path, font.size, layout_engine=ImageFont.Layout.BASIC)
+        text, kw = get_display(arabic_reshaper.reshape(text)), {}
+    box = draw.textbbox((0, 0), text, font=font, **kw)
+    w, h = box[2] - box[0], box[3] - box[1]
+    if xy is not None:
+        x, y = xy
+        draw.text((x - box[0] + ((anchor_width - w) // 2 if anchor_width else 0), y - box[1]), text,
+                  font=font, fill=fill, **kw)
+    return w, h
+
+
+def _prepare_logo(logo, bg: str):
+    """Logo as RGBA on a transparent background: its own cream turns transparent (so no lighter box
+    shows on the frame), and the empty margin around it is cropped away."""
+    from PIL import Image, ImageChops
+
+    rgb = logo.convert("RGB")
+    corner = Image.new("RGB", rgb.size, rgb.getpixel((2, 2)))
+    diff = ImageChops.difference(rgb, corner).convert("L")
+    box = diff.point(lambda v: 255 if v > 24 else 0).getbbox()
+    alpha = diff.point(lambda v: min(255, v * 6))          # partial alpha keeps anti-aliased edges soft
+    out = rgb.convert("RGBA")
+    out.putalpha(alpha)
+    return out.crop(box) if box else out
+
+
+def render_layer(style: FrameStyle, rect: tuple[int, int, int, int]):
+    """RGBA image: opaque everywhere except the (rounded) video window, which is transparent."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    W, H = style.width, style.height
+    x, y, w, h = rect
+    layer = Image.new("RGBA", (W, H), style.bg)
+    draw = ImageDraw.Draw(layer)
+
+    # logo, centred in the top bar
+    if style.logo and Path(style.logo).exists():
+        logo = _prepare_logo(Image.open(style.logo), style.bg)
+        target_h = style.top_bar - 50
+        scale = min(target_h / logo.height, (W - 2 * style.side_margin) / logo.width)
+        logo = logo.resize((max(1, round(logo.width * scale)), max(1, round(logo.height * scale))), Image.LANCZOS)
+        layer.alpha_composite(logo, ((W - logo.width) // 2, (style.top_bar - logo.height) // 2))
+
+    # credit line, centred in the bottom bar
+    if style.credit:
+        font_path = style.font or "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        font = ImageFont.truetype(str(font_path), 40)
+        # thin gold rule with a small diamond between the window and the credit
+        ry = H - style.bottom_bar + 26
+        draw.line([(W // 2 - 220, ry), (W // 2 - 18, ry)], fill=style.gold, width=3)
+        draw.line([(W // 2 + 18, ry), (W // 2 + 220, ry)], fill=style.gold, width=3)
+        draw.polygon([(W // 2, ry - 9), (W // 2 + 9, ry), (W // 2, ry + 9), (W // 2 - 9, ry)], fill=style.gold)
+        _, th = _draw_arabic(draw, None, style.credit, font, style.navy)
+        _draw_arabic(draw, (0, ry + (style.bottom_bar - 26 - th) // 2 - 4), style.credit, font, style.navy,
+                     anchor_width=W)
+
+    # gold ring around the window, then punch the transparent hole (both anti-aliased via supersampling)
+    s = SUPERSAMPLE
+    ring = Image.new("L", (W * s, H * s), 0)
+    ImageDraw.Draw(ring).rounded_rectangle(
+        [(x - style.border) * s, (y - style.border) * s, (x + w + style.border) * s - 1, (y + h + style.border) * s - 1],
+        radius=(style.radius + style.border) * s, fill=255)
+    hole = Image.new("L", (W * s, H * s), 0)
+    ImageDraw.Draw(hole).rounded_rectangle([x * s, y * s, (x + w) * s - 1, (y + h) * s - 1],
+                                           radius=style.radius * s, fill=255)
+    ring = ring.resize((W, H), Image.LANCZOS)
+    hole = hole.resize((W, H), Image.LANCZOS)
+    gold = Image.new("RGBA", (W, H), style.gold)
+    layer = Image.composite(gold, layer, ring)
+    alpha = hole.point(lambda v: 255 - v)
+    layer.putalpha(alpha)
+    return layer
+
+
+def frame_filter(style: FrameStyle, rect: tuple[int, int, int, int]) -> str:
+    x, y, w, h = rect
+    return (f"[0:v]scale={w}:{h}:flags=lanczos,setsar=1,fps={style.fps},format=yuv420p[vid];"
+            f"color=c={style.bg.replace('#', '0x')}:s={style.width}x{style.height}:r={style.fps},format=yuv420p[bg];"
+            f"[bg][vid]overlay={x}:{y}:shortest=1[comp];"
+            f"[comp][1:v]overlay=0:0:format=auto:shortest=1,format=yuv420p[out]")
+
+
+def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_dir: Path,
+                 timeout_seconds: int = 3600) -> Path:
+    """Re-encode `src` inside the frame into `out` (one ffmpeg pass)."""
+    rect = video_rect(style, info.width, info.height)
+    layer_path = work_dir / f"{src.stem}.frame.png"
+    render_layer(style, rect).save(layer_path)
+    gop = style.fps * 2
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-framerate", str(style.fps), "-loop", "1",
+           "-i", str(layer_path), "-filter_complex", frame_filter(style, rect),
+           "-map", "[out]", "-map", "0:a:0?",
+           "-c:v", "libx264", "-preset", style.preset, "-crf", str(style.crf), "-profile:v", "high",
+           "-level:v", "4.1", "-pix_fmt", "yuv420p", "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
+           "-c:a", "aac", "-b:a", style.audio_bitrate, "-ar", "48000", "-ac", "2",
+           "-movflags", "+faststart", "-shortest", str(out)]
+    log.info("framing %s: window %dx%d at (%d,%d) in %dx%d", src.name, rect[2], rect[3], rect[0], rect[1],
+             style.width, style.height)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        out.unlink(missing_ok=True)
+        raise TranscodeError(f"ffmpeg (frame) timed out after {timeout_seconds}s") from exc
+    finally:
+        layer_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        out.unlink(missing_ok=True)
+        raise TranscodeError(f"ffmpeg (frame) failed: {result.stderr.strip()[-400:]}")
+    return out

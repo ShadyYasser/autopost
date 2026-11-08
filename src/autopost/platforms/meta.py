@@ -255,8 +255,11 @@ class InstagramPublisher(_MetaBase):
         self._held: int | None = None
 
     def _container(self, ctx: PublishContext, g: GraphClient, **source) -> dict:
-        return g.call("POST", f"{ctx.cfg.ig_user_id}/media", data={
-            "media_type": "REELS", "caption": ctx.texts["text"], "share_to_feed": "true", **source})
+        data = {"media_type": "REELS", "caption": ctx.texts["text"], "share_to_feed": "true", **source}
+        cover = ctx.cover() if ctx.cover else None
+        if cover is not None:
+            data["thumb_offset"] = str(cover.offset_ms)      # cover = the frame at this millisecond
+        return g.call("POST", f"{ctx.cfg.ig_user_id}/media", data=data)
 
     def publish(self, ctx: PublishContext) -> Outcome:
         path = Path(ctx.fetch_video())

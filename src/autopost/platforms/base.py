@@ -43,6 +43,7 @@ class PublishContext:
     services: Services
     fetch_video: Callable[[], "object"] = field(repr=False, default=None)  # downloads once, returns local Path
     media_info: Callable[[], "object"] = field(repr=False, default=None)   # MediaInfo (ffprobe, else Drive)
+    cover: Callable[[], "object"] = field(repr=False, default=None)        # Cover (offset_ms, image_path) or None
 
 
 @dataclass

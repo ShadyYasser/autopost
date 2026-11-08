@@ -25,6 +25,32 @@ text_source:
     "＂": "\""
   skip_titles: ["معاذ عليان"]   # reel without a caption: not posted, one Telegram alert per file
 
+# Every video is checked before it is used, by an open language model that runs on the GitHub runner
+# (no key, no quota): the title is rewritten if needed (insults, mockery, shock-bait and group
+# generalizations removed, topic kept), and what is said in the reel is transcribed by Whisper and judged too.
+# Videos judged "high" risk are held back with a Telegram alert and the next one is used. If the model or
+# Whisper fails, nothing is posted (retried next run). The `prescreen` workflow checks the next videos ahead
+# of time. Rename a held-back file and it is checked again under its new name.
+title_guard:
+  enabled: true
+  provider: local              # local | openai_compatible (e.g. Groq free tier) | anthropic
+  gguf_repo: Qwen/Qwen3-8B-GGUF
+  gguf_file: Qwen3-8B-Q4_K_M.gguf
+  # Groq instead (free key from console.groq.com, stored as the GROQ_API_KEY secret):
+  #   provider: openai_compatible
+  #   base_url: https://api.groq.com/openai/v1
+  #   model: llama-3.3-70b-versatile
+  #   api_key_secret: GROQ_API_KEY
+  block_levels: [high]
+  audio:
+    enabled: true
+    streams: [short]           # long videos are not transcribed
+    whisper_model: large-v3    # large-v3-turbo is ~4x faster and a little less accurate
+    max_seconds: 180
+  context: |
+    The reels are made by Moaz Alyan, who allows reposting. The page presents religious texts and claims for
+    discussion; it must read as respectful dialogue.
+
 streams:
   short:                       # filled by tg2drive (ShadyYasser/tg2drive) from the Telegram group
     drive_folder_id: "1qf_opI5CAtrP5iDn3goNxAZY23rj7Z4c"
@@ -34,8 +60,11 @@ streams:
       size: 400                # its last msg_id is fixed in state once 400 reels are in the folder
       boundary_msg_id: null    # or set the last backfill msg_id here by hand
     media:
-      transcode: codec_only    # original Telegram files: re-encode only HEVC/AV1/etc.
+      transcode: codec_only    # (not used while `frame` is set: framed videos are always re-encoded once)
       upscale: false
+    frame:                     # logo on top, the reel in a rounded window, source credit below (1080x1920)
+      credit: "المصدر: معاذ عليان"
+    cover: random_frame        # cover/thumbnail = a random good frame (Instagram + TikTok/YouTube via Buffer)
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
   long:
     drive_folder_id: "1MKCjqE2rKpeT3dGfYtwe7LmYhnZ6CGdP"

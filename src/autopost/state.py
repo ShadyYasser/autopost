@@ -371,11 +371,16 @@ _STATUS_RANK = {"scheduled": 0, "pending": 0, "in_progress": 1, "checking": 1, "
                 "partial": 3, "done": 3, "skipped": 3, "sent": 3, "manual": 3, "gave_up": 3, "skipped_deadline": 3}
 
 
-def merge_states(theirs: str | Path, ours: str | Path, out: str | Path) -> dict[str, int]:
+def merge_states(theirs: str | Path, ours: str | Path, out: str | Path,
+                 kv_ours_prefixes: tuple[str, ...] | None = None) -> dict[str, int]:
     """Merge two state DBs (e.g. after a push conflict) without losing anything either one recorded.
 
     Rows are matched by natural keys (not autoincrement ids). When both copies have a row, the one
     that is further along (status) or more recently updated wins. Append-only tables are unioned.
+
+    kv rows: ours wins. With `kv_ours_prefixes` (a job that only writes keys with those prefixes, such
+    as the prescreen job, whose copy of every other key may be stale) ours only wins for those keys and
+    fills gaps for the others; theirs keeps its value.
     """
     import shutil
 
@@ -444,7 +449,10 @@ def merge_states(theirs: str | Path, ours: str | Path, out: str | Path) -> dict[
         if dst.execute("INSERT OR IGNORE INTO alerts_sent VALUES (?,?)", tuple(r)).rowcount:
             bump("alerts_sent")
     for r in src.execute("SELECT * FROM kv"):
-        dst.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", tuple(r))
+        if kv_ours_prefixes is None or str(r["key"]).startswith(kv_ours_prefixes):
+            dst.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", tuple(r))
+        else:
+            dst.execute("INSERT OR IGNORE INTO kv VALUES (?,?)", tuple(r))
     for r in src.execute("SELECT * FROM caption_cursor"):
         cur = dst.execute("SELECT * FROM caption_cursor WHERE brand=?", (r["brand"],)).fetchone()
         if cur is None or r["updated_utc"] > cur["updated_utc"]:

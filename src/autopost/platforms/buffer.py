@@ -197,7 +197,7 @@ class BufferPublisher:
                     return org["id"], ch["id"]
         raise BufferError(f"channel {channel_name!r} not found in Buffer account {account}")
 
-    def payload(self, ctx: PublishContext, channel_id: str, video_url: str) -> dict:
+    def payload(self, ctx: PublishContext, channel_id: str, video_url: str, thumbnail_url: str | None = None) -> dict:
         texts = ctx.texts
         if ctx.platform == "youtube":
             text, title = texts["description"], texts["title"]
@@ -207,7 +207,8 @@ class BufferPublisher:
         else:
             text, title, metadata = texts["text"], None, None
         payload = {"channelId": channel_id, "text": text, "mode": "shareNow", "schedulingType": "automatic",
-                   "assets": [{"video": {"url": video_url, **({"metadata": {"title": title}} if title else {})}}]}
+                   "assets": [{"video": {"url": video_url, **({"thumbnailUrl": thumbnail_url} if thumbnail_url else {}),
+                                         **({"metadata": {"title": title}} if title else {})}}]}
         if metadata:
             payload["metadata"] = metadata
         return payload
@@ -231,9 +232,12 @@ class BufferPublisher:
             return Outcome(status="failed", error=f"{reason}; Telegram hand-off failed too", provider="buffer")
         return Outcome(status="manual", error=reason, provider="buffer")
 
-    def _cleanup(self, asset_id: str | None) -> None:
-        if asset_id and self.host is not None:
-            self.host.delete(asset_id)
+    def _cleanup(self, asset_ids: str | None) -> None:
+        """Delete hosted files: one id, or several joined with "|" (the video and its cover image)."""
+        if asset_ids and self.host is not None:
+            for asset_id in str(asset_ids).split("|"):
+                if asset_id:
+                    self.host.delete(asset_id)
 
     # ------------------------------------------------------------ publisher API
 
@@ -250,21 +254,44 @@ class BufferPublisher:
                 return self.manual(ctx, f"not a Short: {problem}")
         if self.host is None:
             return self.manual(ctx, "no public hosting available (GITHUB_TOKEN/GITHUB_REPOSITORY missing)")
-        asset_id = None
+        hosted: list[int | str] = []        # release assets to delete when the post is done
         try:
             org_id, channel_id = self.resolve(cfg.buffer_account, cfg.channel)
             limit = self.services.app.settings.buffer_accounts[cfg.buffer_account].limits.max_queued
             if self.client(cfg.buffer_account).queued(org_id, channel_id) >= limit:
                 raise BufferError(f"{limit} posts already queued on this channel")
             url, asset_id = self.host.upload(Path(ctx.fetch_video()), f"{ctx.brand.id}-{ctx.platform}")
-            post = self.client(cfg.buffer_account).create_post(self.payload(ctx, channel_id, url))
+            hosted.append(asset_id)
+            thumb_url = self._host_cover(ctx, hosted)
+            try:
+                post = self.client(cfg.buffer_account).create_post(self.payload(ctx, channel_id, url, thumb_url))
+            except BufferError as exc:
+                if not thumb_url:
+                    raise
+                # The cover is optional: if Buffer refuses it, post the video with its default cover.
+                log.warning("buffer %s: post with cover failed (%s); retrying without it", ctx.platform, exc)
+                post = self.client(cfg.buffer_account).create_post(self.payload(ctx, channel_id, url))
         except Exception as exc:  # noqa: BLE001 - every Buffer/hosting problem ends in the Telegram hand-off
             log.error("buffer %s: %s", ctx.platform, exc)
-            self._cleanup(asset_id)
+            self._cleanup("|".join(str(a) for a in hosted))
             return self.manual(ctx, str(exc))
         log.info("buffer: created %s post %s (%s)", ctx.platform, post["id"], post.get("status"))
-        return Outcome(status="checking", external_id=f"{post['id']}|{asset_id}", provider="buffer",
+        return Outcome(status="checking", external_id=f"{post['id']}|{'|'.join(str(a) for a in hosted)}",
+                       provider="buffer",
                        check_after=self.services.now() + timedelta(seconds=POLL_STEPS[0]))
+
+    def _host_cover(self, ctx: PublishContext, hosted: list) -> str | None:
+        """Put the chosen cover frame on the public host; None when there is none or hosting it fails."""
+        cover = ctx.cover() if ctx.cover else None
+        if cover is None:
+            return None
+        try:
+            url, asset_id = self.host.upload(Path(cover.image_path), f"{ctx.brand.id}-{ctx.platform}-cover")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("buffer %s: could not host the cover (%s); using the default cover", ctx.platform, exc)
+            return None
+        hosted.append(asset_id)
+        return url
 
     def check(self, ctx: PublishContext, delivery) -> Outcome:
         post_id, _, asset_id = (delivery.external_id or "").partition("|")

@@ -482,10 +482,14 @@ class Runner:
                 chain.media = self.content.probe(chain.video)
             return chain.media
 
+        def cover():
+            get = getattr(self.content, "cover", None)
+            return get(chain.video) if get else None
+
         return PublishContext(brand=chain.brand, stream=chain.stream, platform=d.platform, cfg=cfg,
                               post_id=chain.post_id, video=chain.video, texts=texts,
                               deadline=chain.slot.deadline, services=self.services, fetch_video=fetch,
-                              media_info=media_info)
+                              media_info=media_info, cover=cover)
 
     def process_next(self, chain: Chain, checks: list[Check]) -> None:
         d = self.state.delivery(chain.queue.popleft())
