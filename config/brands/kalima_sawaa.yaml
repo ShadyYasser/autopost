@@ -28,7 +28,8 @@ text_source:
 # Every video is checked before it is used, by an open language model that runs on the GitHub runner
 # (no key, no quota): the title is rewritten if needed (insults, mockery, shock-bait and group
 # generalizations removed, topic kept), and what is said in the reel is transcribed by Whisper and judged too.
-# Videos judged "high" risk are held back with a Telegram alert and the next one is used. If the model or
+# Videos judged "high" risk are held back with a Telegram alert and the next one is used. Exception: a title
+# that is "high" on its own gets a new title (from the title or the transcript) when the speech passes the audio check. If the model or
 # Whisper fails, nothing is posted (retried next run). The `prescreen` workflow checks the next videos ahead
 # of time. Rename a held-back file and it is checked again under its new name.
 title_guard:
