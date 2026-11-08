@@ -84,6 +84,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          # also keyed on requirements-ml.txt: the speech-to-text and local-model wheels installed on first
+          # use (autopost.mldeps) are saved in, and restored from, this pip cache
+          cache-dependency-path: |
+            requirements.txt
+            requirements-ml.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt

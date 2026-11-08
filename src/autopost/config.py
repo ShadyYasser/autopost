@@ -424,6 +424,74 @@ class StreamMediaConfig(_Model):
     upscale: bool = True              # false: never enlarge small videos
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_asset(path: str) -> Path:
+    """Asset paths in the config are relative to the repository root."""
+    p = Path(path)
+    return p if p.is_absolute() else REPO_ROOT / p
+
+
+class FrameConfig(_Model):
+    """Put every video of the stream inside a branded frame (logo on top, source credit below)."""
+    logo: str = "assets/kalima_sawaa/logo.png"
+    credit: str | None = None            # e.g. "المصدر: معاذ عليان"
+    font: str = "assets/fonts/DejaVuSans-Bold.ttf"
+    bg: str = "#fbf6ed"                  # the logo's own cream
+    navy: str = "#092e48"
+    gold: str = "#a47a3c"
+    crf: int = Field(18, ge=0, le=51)
+
+
+class AudioCheckConfig(_Model):
+    """Judge what is said in a reel too: Whisper transcribes the first seconds, the same model judges the text."""
+    enabled: bool = True
+    streams: list[str] = Field(default_factory=lambda: ["short"])    # long videos are too slow to transcribe
+    whisper_model: str = "large-v3"      # large-v3-turbo is ~4x faster and a little less accurate
+    compute_type: str = "int8"
+    max_seconds: int = Field(180, ge=15, le=900)
+    language: str = "ar"
+
+
+class TitleGuardConfig(_Model):
+    """LLM check of a video before it is used: the title is rewritten if needed, the title and the speech are
+    judged, and a video of a blocked risk level is held back.
+
+    provider:
+      local              an open model (GGUF, run by llama.cpp) on the GitHub runner: no key, no quota, slower
+      openai_compatible  any OpenAI-style API, e.g. Groq's free tier (base_url + model + api_key_secret)
+      anthropic          Claude (model + api_key_secret)
+    """
+    enabled: bool = True
+    provider: Literal["local", "openai_compatible", "anthropic"] = "local"
+    gguf_repo: str = "Qwen/Qwen3-8B-GGUF"            # provider: local
+    gguf_file: str = "Qwen3-8B-Q4_K_M.gguf"
+    n_ctx: int = Field(4096, ge=1024, le=32768)
+    model: str | None = None                          # provider: openai_compatible / anthropic
+    base_url: str | None = None                       # provider: openai_compatible, e.g. https://api.groq.com/openai/v1
+    api_key_secret: str | None = None
+    # risk levels that keep the video from being posted (alert on Telegram, next video is used instead)
+    block_levels: list[Literal["medium", "high"]] = Field(default_factory=lambda: ["high"])
+    context: str = ""                    # extra description of the channel for the prompt
+    audio: AudioCheckConfig | None = None
+
+    v_s = field_validator("api_key_secret")(_check_secret_name)
+
+    @model_validator(mode="after")
+    def _provider(self) -> "TitleGuardConfig":
+        if self.provider != "local":
+            if not (self.model and self.api_key_secret):
+                raise ValueError(f"provider {self.provider} needs `model` and `api_key_secret`")
+        if self.provider == "openai_compatible" and not self.base_url:
+            raise ValueError("provider openai_compatible needs `base_url`")
+        return self
+
+    def audio_for(self, stream: str) -> "AudioCheckConfig | None":
+        a = self.audio
+        return a if (a is not None and a.enabled and stream in a.streams) else None
+
+
 class StreamConfig(_Model):
     drive_folder_id: str
     # created_time: oldest Drive createdTime first.
@@ -436,6 +504,9 @@ class StreamConfig(_Model):
     overrides: dict[PlatformName, dict[str, Any]] = Field(default_factory=dict)
     backfill: BackfillConfig | None = None
     media: StreamMediaConfig = Field(default_factory=StreamMediaConfig)
+    frame: FrameConfig | None = None
+    # random_frame: cover/thumbnail = a random good frame of the video (Instagram, and TikTok/YouTube via Buffer)
+    cover: Literal["none", "random_frame"] = "none"
 
     @model_validator(mode="after")
     def _folder(self) -> "StreamConfig":
@@ -454,6 +525,7 @@ class BrandConfig(_Model):
     prayer_times: PrayerTimesConfig | None = None
     min_slot_spacing_minutes: int | None = Field(None, ge=0)
     text_source: TextSource
+    title_guard: TitleGuardConfig | None = None
     streams: dict[str, StreamConfig] = Field(min_length=1)
     templates: dict[PlatformName, TemplateConfig]
     platforms: dict[PlatformName, PlatformConfig]
@@ -507,6 +579,8 @@ class AppConfig(BaseModel):
         add(s.telegram.bot_token_secret, "telegram")
         add(s.telegram.chat_id_secret, "telegram")
         for brand in self.enabled_brands():
+            if brand.title_guard and brand.title_guard.enabled:
+                add(brand.title_guard.api_key_secret, f"{brand.id}/title_guard")   # None for provider: local
             for stream_name, stream in brand.streams.items():
                 for p in stream.platforms:
                     cfg = brand.platform_for(stream_name, p)
@@ -554,9 +628,18 @@ def validate_brand(brand: BrandConfig, settings: Settings) -> list[str]:
     if needs_prayer and not (brand.prayer_times or settings.prayer_times):
         errors.append(f"{p}: prayer-based slots need `prayer_times` in settings or in the brand")
 
+    if brand.title_guard and brand.title_guard.audio:
+        for stream_name in brand.title_guard.audio.streams:
+            if stream_name not in brand.streams:
+                errors.append(f"{p}: title_guard.audio lists unknown stream {stream_name!r}")
+
     variables = brand.text_source.variables()
     for name, stream in brand.streams.items():
         sp = f"{p} stream {name}"
+        if stream.frame:
+            for label, asset in (("logo", stream.frame.logo), ("font", stream.frame.font)):
+                if not resolve_asset(asset).exists():
+                    errors.append(f"{sp}: frame {label} file not found: {asset}")
         for slot in stream.slots:
             if slot not in brand.slots:
                 errors.append(f"{sp}: unknown slot {slot!r} (defined: {sorted(brand.slots)})")

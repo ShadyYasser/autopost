@@ -43,7 +43,9 @@ for attempt in 1 2 3 4 5; do
   git show "origin/${BRANCH}:${DB}" > "$THEIRS" 2>/dev/null || rm -f "$THEIRS"
   git reset -q --hard "origin/${BRANCH}"
   if [ -s "$THEIRS" ]; then
-    python -m autopost merge-state --theirs "$THEIRS" --ours "$BACKUP" --out "$DB"
+    # AUTOPOST_KV_OURS_PREFIXES: a job that only writes some kv keys (prescreen) keeps the others from origin
+    python -m autopost merge-state --theirs "$THEIRS" --ours "$BACKUP" --out "$DB" \
+      --kv-ours-prefixes "${AUTOPOST_KV_OURS_PREFIXES:-}"
   else
     cp "$BACKUP" "$DB"
   fi

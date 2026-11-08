@@ -96,10 +96,52 @@ class FakeClient:
         return dest
 
 
-def make(app, tmp_path, dry_run=False):
+class AnthropicResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self, verdict, status=200):
+        self.status_code = status
+        self._verdict = verdict
+
+    def json(self):
+        import json
+
+        return {"content": [{"type": "text", "text": json.dumps(self._verdict, ensure_ascii=False)}]}
+
+
+class EchoAnthropic:
+    """Fake Anthropic API session: every title is judged `low` (kept) unless `verdicts[title]` says otherwise."""
+
+    def __init__(self, verdicts=None, status=200):
+        self.calls = []
+        self.verdicts = verdicts or {}
+        self.status = status
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        import json as _json
+
+        title = _json.loads(json["messages"][0]["content"])["title"]
+        self.calls.append(title)
+        if self.status != 200:
+            return AnthropicResponse({}, self.status)
+        return AnthropicResponse(self.verdicts.get(title, {"title": title, "risk": "low", "reasons": []}))
+
+
+def make(app, tmp_path, dry_run=False, guard=None, backend=None, transcriber=None, audio=None):
+    """DriveContent over the fake Drive. By default the title check talks to the fake Anthropic session and the
+    audio check is off; pass `backend` / `transcriber` / `audio` (an AudioCheckConfig) to exercise those."""
+    from autopost.secret_store import Secrets
+
+    cfg = app.brands["kalima_sawaa"].title_guard
+    cfg.provider, cfg.model, cfg.api_key_secret = "anthropic", "claude-sonnet-5-5", "ANTHROPIC_API_KEY"
+    cfg.audio = audio
     state = State(tmp_path / "s.db")
     client = FakeClient()
-    return DriveContent(app, state, client, tmp_path / "media", dry_run), state, client
+    return DriveContent(app, state, client, tmp_path / "media", dry_run,
+                        secrets=Secrets({"ANTHROPIC_API_KEY": "test-key"}),
+                        guard_session=guard or EchoAnthropic(), guard_backend=backend,
+                        transcriber=transcriber), state, client
 
 
 def test_videos_oldest_first_and_used_ones_skipped(app, tmp_path):

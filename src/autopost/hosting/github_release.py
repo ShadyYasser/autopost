@@ -25,6 +25,10 @@ class HostingError(Exception):
     pass
 
 
+def _content_type(path: Path) -> str:
+    return {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}.get(path.suffix.lower(), "video/mp4")
+
+
 class GitHubReleaseHost:
     def __init__(self, repo: str, token: str, tag: str = "media-temp", session: requests.Session | None = None):
         self.repo = repo
@@ -69,7 +73,7 @@ class GitHubReleaseHost:
         with path.open("rb") as fh:
             resp = self._req("POST", f"{UPLOADS}/repos/{self.repo}/releases/{rel['id']}/assets",
                              params={"name": name}, data=fh, timeout=1800,
-                             headers={"Content-Type": "video/mp4", "Content-Length": str(path.stat().st_size)})
+                             headers={"Content-Type": _content_type(path), "Content-Length": str(path.stat().st_size)})
         if resp.status_code >= 300:
             raise HostingError(f"asset upload: HTTP {resp.status_code} {resp.text[:200]}")
         asset = resp.json()

@@ -1,0 +1,84 @@
+name: prescreen
+
+# Title + audio checks (Whisper and a local language model, both on this runner) for the videos that will be
+# posted next, so the publishing runs only find cached verdicts. Verdicts are committed with state/state.db.
+# A video judged high risk is held back with a Telegram alert. Does nothing until cron_enabled: true.
+
+on:
+  schedule:
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      brand:
+        description: "Only this brand id (empty = all)"
+        type: string
+        default: ""
+      limit:
+        description: "Videos to check per stream, in posting order"
+        type: string
+        default: "6"
+      dry_run:
+        description: "Dry run: nothing is committed and no alert is sent"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # commit state/state.db
+
+# Its own queue: a prescreen never makes a publishing run wait. Verdicts are merged into the newest state by
+# scripts/commit_state.sh (only the guard:/audio: keys of this job win).
+concurrency:
+  group: autopost-prescreen
+  cancel-in-progress: false
+
+jobs:
+  prescreen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    env:
+      PYTHONPATH: src
+      PYTHONUNBUFFERED: "1"
+      SECRETS_JSON: ${{ toJSON(secrets) }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      AUTOPOST_TRIGGER: ${{ github.event_name == 'schedule' && 'cron' || 'manual' }}
+      AUTOPOST_KV_OURS_PREFIXES: "guard:,audio:"
+      BRAND: ${{ github.event_name == 'workflow_dispatch' && inputs.brand || '' }}
+      LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.limit || '6' }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-ml.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: ffmpeg cache key
+        id: ffkey
+        run: echo "key=ffmpeg-debs-${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ffmpeg packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ffmpeg-debs
+          key: ${{ steps.ffkey.outputs.key }}
+
+      - name: Prescreen
+        run: |
+          set -euo pipefail
+          args=(--limit "$LIMIT" --max-minutes 120)
+          [ -n "$BRAND" ] && args+=(--brand "$BRAND")
+          [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+          python -m autopost prescreen "${args[@]}"
+
+      - name: Commit state
+        if: always() && env.DRY_RUN != 'true'
+        run: bash scripts/commit_state.sh "prescreen ${{ github.run_id }}"

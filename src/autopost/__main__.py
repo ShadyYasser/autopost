@@ -102,7 +102,7 @@ def make_content(app: AppConfig, state: State, secrets: Secrets, dry_run: bool, 
         raise MissingSecret(name)
     session, email = session_from_service_account(secrets.get(name))
     log.info("Google: service account %s", email)
-    return DriveContent(app, state, GoogleClient(session), work_dir(), dry_run, notify=notify)
+    return DriveContent(app, state, GoogleClient(session), work_dir(), dry_run, notify=notify, secrets=secrets)
 
 
 def parse_now(value: str | None, app: AppConfig) -> datetime | None:
@@ -703,11 +703,55 @@ def instagram_upload_probe(app: AppConfig, brand, g, drive_id: str, modes: set[s
     return 0
 
 
+def cmd_prescreen(args, app: AppConfig) -> int:
+    """Title + audio checks on the videos that will be posted next, so publishing runs find cached verdicts.
+
+    Verdicts are stored in state; the workflow commits it. --dry-run works on a throwaway copy of the state."""
+    import time
+
+    scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule" or os.environ.get("AUTOPOST_TRIGGER") == "cron"
+    if scheduled and not app.settings.cron_enabled:
+        log.info("cron_enabled is false in config/settings.yaml: scheduled prescreen does nothing")
+        return 0
+    secrets = Secrets()
+    state, tmpdir = open_state(args.state, throwaway=args.dry_run)
+    tz = app.settings.tz
+    notifier = make_notifier(app, secrets, dry_run=args.dry_run)
+    problems = 0
+    try:
+        content = make_content(app, state, secrets, dry_run=False,
+                               notify=lambda text, key: notifier.alert(text, key=key, state=state, now=datetime.now(tz)))
+        if not isinstance(content, DriveContent):
+            print("Google credentials missing; nothing to check", file=sys.stderr)
+            return 1
+        deadline = time.monotonic() + args.max_minutes * 60
+        for brand in app.enabled_brands():
+            if args.brand and brand.id != args.brand:
+                continue
+            if brand.title_guard is None or not brand.title_guard.enabled:
+                continue
+            for stream in brand.streams:
+                try:
+                    stats = content.prescreen(brand.id, stream, args.limit, deadline)
+                except ContentError as exc:
+                    print(f"{brand.id}/{stream}: stopped: {exc}")
+                    problems += 1
+                    break
+                print(f"{brand.id}/{stream}: checked {stats['checked']}, held back {stats['held']}, "
+                      f"already checked {stats['already']}")
+    finally:
+        state.close()
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    return 1 if problems else 0
+
+
 def cmd_merge_state(args, app: AppConfig) -> int:
     """Merge two state DBs (used by scripts/commit_state.sh on a push conflict)."""
     from .state import merge_states
 
-    added = merge_states(args.theirs, args.ours, args.out)
+    prefixes = tuple(x for x in (args.kv_ours_prefixes or "").split(",") if x) or None
+    added = merge_states(args.theirs, args.ours, args.out, kv_ours_prefixes=prefixes)
     print("merged state: " + (", ".join(f"{k}+{v}" for k, v in sorted(added.items())) or "no differences"))
     return 0
 
@@ -760,6 +804,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--download", action="store_true", help="dry-run: also download each video and ffprobe it")
     p.add_argument("--placeholder-content", action="store_true", help="dry-run: fake videos instead of Drive")
 
+    p = sub.add_parser("prescreen", help="title + audio checks on the next videos, ahead of their posting time")
+    p.add_argument("--brand")
+    p.add_argument("--limit", type=int, default=6, help="videos to check per stream, in posting order")
+    p.add_argument("--max-minutes", type=int, default=100, help="stop starting new checks after this long")
+    p.add_argument("--dry-run", action="store_true", help="work on a throwaway copy of the state, send no alerts")
+
     p = sub.add_parser("check", help="read-only credential checks (Telegram, Meta, Buffer/Pinterest secrets)")
     p.add_argument("--ping-telegram", action="store_true", help="also send a test message")
 
@@ -785,6 +835,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--theirs", required=True)
     p.add_argument("--ours", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--kv-ours-prefixes", default="",
+                   help="comma separated: our kv values win only for keys with these prefixes")
 
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
@@ -796,7 +848,7 @@ def main(argv: list[str] | None = None) -> int:
     use_clock_for_logs(app.settings.tz)
     try:
         return {"validate": cmd_validate, "plan": cmd_plan, "run": cmd_run, "sources": cmd_sources,
-                "check": cmd_check, "test-post": cmd_test_post, "meta-info": cmd_meta_info, "merge-state": cmd_merge_state, "status": cmd_status}[args.command](
+                "prescreen": cmd_prescreen, "check": cmd_check, "test-post": cmd_test_post, "meta-info": cmd_meta_info, "merge-state": cmd_merge_state, "status": cmd_status}[args.command](
             args, app)
     except (MissingSecret, GoogleError) as exc:
         print(str(exc), file=sys.stderr)

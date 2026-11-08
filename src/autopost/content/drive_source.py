@@ -15,18 +15,24 @@ import dataclasses
 import hashlib
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from ..config import AppConfig, FilenameTextSource, SheetTextSource
+from ..config import AppConfig, FilenameTextSource, SheetTextSource, resolve_asset
+from ..cover import Cover, pick_cover
+from ..frame import FrameStyle, render_video
 from ..media import EncodeSettings, MediaInfo, ProbeError, TranscodeError, from_drive, prepare_for_upload, probe
 from ..state import State
 from .base import TextChoice, VideoItem
 from .google_api import GoogleClient, GoogleError, a1_sheet, natural_key
 from .text import title_from_filename
+from ..title_guard import (AnthropicBackend, AudioVerdict, GuardError, LocalBackend, OpenAICompatBackend,
+                           TitleGuard, Verdict)
+from ..transcribe import TranscribeError, Transcriber, WhisperSettings
 
 log = logging.getLogger(__name__)
 
@@ -160,9 +166,22 @@ def choose_next_row(rows: list[SheetRow], cursor: tuple[int, datetime] | None = 
 
 
 class DriveContent:
+    GUARD_LOOKAHEAD = 20       # how many queued videos one call may check (and hold back) before giving up
+    AUDIO_FRESH_LIMIT = 3      # how many NOT yet checked videos one call may transcribe (each takes minutes)
+
     def __init__(self, app: AppConfig, state: State, client: GoogleClient, work_dir: Path, dry_run: bool,
-                 notify: Callable[[str, str], None] | None = None):
+                 notify: Callable[[str, str], None] | None = None, secrets=None, guard_session=None,
+                 guard_backend=None, transcriber=None, audio_check: bool = True):
         self.app = app
+        self.secrets = secrets
+        self._guard_session = guard_session
+        self._guard_backend = guard_backend            # tests: replaces the model of every brand
+        self._transcriber = transcriber                # tests: replaces Whisper
+        self.audio_check = audio_check and not dry_run  # dry runs never download and transcribe
+        self._guards: dict[str, TitleGuard] = {}
+        self._local_backends: dict[tuple[str, str, int], LocalBackend] = {}
+        self._transcribers: dict[str, Transcriber] = {}
+        self._covers: dict[str, Cover] = {}
         self.state = state
         self.client = client
         self.work_dir = work_dir
@@ -210,7 +229,137 @@ class DriveContent:
 
     def unused(self, brand: str, stream: str) -> list[VideoItem]:
         used = self.state.used_source_ids(brand, stream)
-        return [v for v in self.listing(brand, stream) if v.id not in used and not self.skipped_title(brand, stream, v)]
+        return [v for v in self.listing(brand, stream)
+                if v.id not in used and not self.skipped_title(brand, stream, v) and not self.held_back(brand, v)]
+
+    # ------------------------------------------------------------ title check
+
+    def guard_for(self, brand: str) -> TitleGuard | None:
+        cfg = self.app.brands[brand].title_guard
+        if cfg is None or not cfg.enabled or not isinstance(self.app.brands[brand].text_source, FilenameTextSource):
+            return None
+        if brand not in self._guards:
+            self._guards[brand] = TitleGuard(context=cfg.context, backend=self._guard_backend or self._backend(brand))
+        return self._guards[brand]
+
+    def _backend(self, brand: str):
+        cfg = self.app.brands[brand].title_guard
+        if cfg.provider == "local":
+            key = (cfg.gguf_repo, cfg.gguf_file, cfg.n_ctx)       # one loaded model for all brands that share it
+            if key not in self._local_backends:
+                self._local_backends[key] = LocalBackend(cfg.gguf_repo, cfg.gguf_file, cfg.n_ctx)
+            return self._local_backends[key]
+        if self.secrets is None or not self.secrets.has(cfg.api_key_secret):
+            raise ContentError(f"{brand}: the title check is on but the secret {cfg.api_key_secret} is not set")
+        key_value = self.secrets.get(cfg.api_key_secret)
+        if cfg.provider == "anthropic":
+            return AnthropicBackend(key_value, cfg.model, self._guard_session)
+        return OpenAICompatBackend(cfg.base_url, key_value, cfg.model, self._guard_session)
+
+    def _guard_key(self, brand: str, video: VideoItem) -> tuple[str, str]:
+        """(state key, the title that is judged). The key includes the title, so renaming a file re-checks it."""
+        src = self.app.brands[brand].text_source
+        title = title_from_filename(video.name, src.strip_prefixes, src.replacements)
+        return f"guard:{brand}:{video.id}:{hashlib.sha1(title.encode()).hexdigest()[:10]}", title
+
+    def verdict(self, brand: str, video: VideoItem) -> Verdict | None:
+        """The (cached) title check of a video; None when the brand has no title check."""
+        guard = self.guard_for(brand)
+        if guard is None:
+            return None
+        key, title = self._guard_key(brand, video)
+        raw = self.state.kv_get(key)
+        if raw:
+            try:
+                return Verdict.from_json(raw)
+            except (ValueError, KeyError):
+                pass
+        try:
+            verdict = guard.judge(title)
+        except GuardError as exc:
+            raise ContentError(f"{video.name}: {exc}") from exc
+        self.state.kv_set(key, verdict.to_json())
+        log.info("title check %s [%s]: %r → %r (%s)", video.name, verdict.risk, title, verdict.title,
+                 "; ".join(verdict.reasons))
+        return verdict
+
+    def held_back(self, brand: str, video: VideoItem) -> bool:
+        """True when this video's cached title check says it must not be posted (never calls the API)."""
+        cfg = self.app.brands[brand].title_guard
+        if cfg is None or not cfg.enabled or not isinstance(self.app.brands[brand].text_source, FilenameTextSource):
+            return False
+        raw = self.state.kv_get(self._guard_key(brand, video)[0])
+        if raw:
+            try:
+                if Verdict.from_json(raw).risk in cfg.block_levels:
+                    return True
+            except (ValueError, KeyError):
+                pass
+        raw = self.state.kv_get(self._audio_key(brand, video))
+        if raw:
+            try:
+                return AudioVerdict.from_json(raw).risk in cfg.block_levels
+            except (ValueError, KeyError):
+                return False
+        return False
+
+    # ------------------------------------------------------------ audio check
+
+    def _audio_key(self, brand: str, video: VideoItem) -> str:
+        """Like the title key: renaming the file checks the video again (the way to override a false alarm)."""
+        return self._guard_key(brand, video)[0].replace("guard:", "audio:", 1)
+
+    def audio_on(self, brand: str, stream: str) -> bool:
+        cfg = self.app.brands[brand].title_guard
+        return bool(self.audio_check and cfg and cfg.enabled and cfg.audio_for(stream)
+                    and isinstance(self.app.brands[brand].text_source, FilenameTextSource))
+
+    def transcriber_for(self, brand: str) -> Transcriber:
+        if self._transcriber is not None:
+            return self._transcriber
+        if brand not in self._transcribers:
+            a = self.app.brands[brand].title_guard.audio
+            self._transcribers[brand] = Transcriber(WhisperSettings(model=a.whisper_model, compute_type=a.compute_type,
+                                                                    language=a.language, max_seconds=a.max_seconds))
+        return self._transcribers[brand]
+
+    def cached_audio(self, brand: str, video: VideoItem) -> AudioVerdict | None:
+        raw = self.state.kv_get(self._audio_key(brand, video))
+        if not raw:
+            return None
+        try:
+            return AudioVerdict.from_json(raw)
+        except (ValueError, KeyError):
+            return None
+
+    def audio_verdict(self, brand: str, stream: str, video: VideoItem) -> AudioVerdict:
+        """What is said in the video, judged (cached in state). Downloads the original, transcribes the first
+        seconds, deletes the download. Any failure raises ContentError: nothing is posted, the next run retries."""
+        cached = self.cached_audio(brand, video)
+        if cached is not None:
+            return cached
+        guard = self.guard_for(brand)
+        suffix = Path(video.name).suffix.lower() or ".mp4"
+        dest = self.work_dir / f"{video.id}.screen{suffix}"
+        try:
+            log.info("audio check: downloading %s (%s)", video.name, _size(video.size))
+            self.client.download(video.id, dest, video.size)
+            text = self.transcriber_for(brand).transcribe(dest, self.work_dir)
+            verdict = guard.judge_audio(self._guard_key(brand, video)[1], text)
+        except (GoogleError, TranscribeError, GuardError) as exc:
+            raise ContentError(f"{video.name}: audio check failed: {exc}") from exc
+        finally:
+            dest.unlink(missing_ok=True)
+        self.state.kv_set(self._audio_key(brand, video), verdict.to_json())
+        log.info("audio check %s [%s]: %s", video.name, verdict.risk, "; ".join(verdict.reasons))
+        return verdict
+
+    def _alert_hold(self, brand: str, stream: str, video: VideoItem, what: str, risk: str, shown: str,
+                    reasons: tuple[str, ...]) -> None:
+        self.notify(f"{self.app.brands[brand].name}/{stream}: held back by the {what} check ({risk}): «{shown}»\n"
+                    f"{'; '.join(reasons)}\n{video.web_link or video.id}\n"
+                    f"Rename the file to change this; it is checked again under its new name.",
+                    f"guard-hold:{brand}:{video.id}")
 
     def skipped_title(self, brand: str, stream: str, video: VideoItem) -> bool:
         """True for files whose title is in skip_titles (e.g. a reel without a caption); alerts once per file."""
@@ -272,7 +421,59 @@ class DriveContent:
 
     def next_video(self, brand: str, stream: str, slot: str | None = None) -> VideoItem | None:
         pending = self.unused(brand, stream)
-        return dataclasses.replace(pending[0]) if pending else None
+        cfg = self.app.brands[brand].title_guard
+        if not pending or cfg is None or not cfg.enabled:
+            return dataclasses.replace(pending[0]) if pending else None
+        audio = self.audio_on(brand, stream)
+        fresh = 0
+        for video in pending[: self.GUARD_LOOKAHEAD]:
+            verdict = self.verdict(brand, video)          # a model failure raises: nothing is posted (fail closed)
+            if verdict is not None and verdict.risk in cfg.block_levels:
+                self._alert_hold(brand, stream, video, "title", verdict.risk, verdict.original, verdict.reasons)
+                continue
+            if audio and verdict is not None:
+                if self.cached_audio(brand, video) is None:
+                    if fresh >= self.AUDIO_FRESH_LIMIT:
+                        raise ContentError(f"{self.AUDIO_FRESH_LIMIT} videos in a row were held back by the audio "
+                                           f"check; the next run continues with the following ones")
+                    fresh += 1
+                heard = self.audio_verdict(brand, stream, video)
+                if heard.risk in cfg.block_levels:
+                    self._alert_hold(brand, stream, video, "audio", heard.risk, heard.excerpt, heard.reasons)
+                    continue
+            return dataclasses.replace(video)
+        raise ContentError(f"the next {self.GUARD_LOOKAHEAD} videos were all held back by the title/audio check")
+
+    def prescreen(self, brand: str, stream: str, limit: int, deadline: float | None = None) -> dict[str, int]:
+        """Run the title and audio checks on the next `limit` videos of the stream, in posting order, so the
+        publishing run only finds cached verdicts. Stops at `deadline` (time.monotonic); a model failure
+        raises ContentError (the verdicts stored so far stay in state)."""
+        stats = {"checked": 0, "held": 0, "already": 0}
+        cfg = self.app.brands[brand].title_guard
+        if cfg is None or not cfg.enabled or self.guard_for(brand) is None:
+            return stats
+        audio = self.audio_on(brand, stream)
+        for video in self.unused(brand, stream)[:limit]:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            before = (self.state.kv_get(self._guard_key(brand, video)[0]) is not None,
+                      not audio or self.cached_audio(brand, video) is not None)
+            if all(before):
+                stats["already"] += 1
+                continue
+            verdict = self.verdict(brand, video)
+            held = None
+            if verdict is not None and verdict.risk in cfg.block_levels:
+                held = ("title", verdict.risk, verdict.original, verdict.reasons)
+            elif audio:
+                heard = self.audio_verdict(brand, stream, video)
+                if heard.risk in cfg.block_levels:
+                    held = ("audio", heard.risk, heard.excerpt, heard.reasons)
+            stats["checked"] += 1
+            if held:
+                stats["held"] += 1
+                self._alert_hold(brand, stream, video, *held)
+        return stats
 
     def remaining(self, brand: str, stream: str) -> int:
         return len(self.unused(brand, stream))
@@ -296,15 +497,44 @@ class DriveContent:
         suffix = Path(video.name).suffix.lower() or ".mp4"
         dest = self.work_dir / f"{video.id}{suffix}"
         log.info("downloading %s (%s)", video.name, _size(video.size))
+        style = self.frame_style_for(video)
         try:
             original = self.client.download(video.id, dest, video.size)
-            prepared, before, after = prepare_for_upload(original, self.work_dir, self.encode_for(video))
+            if style is not None:
+                before = probe(original)
+                prepared = render_video(original, self.work_dir / f"{video.id}.framed.mp4", style, before,
+                                        self.work_dir, self.encode.timeout_seconds)
+                after = probe(prepared)
+            else:
+                prepared, before, after = prepare_for_upload(original, self.work_dir, self.encode_for(video))
         except (GoogleError, ProbeError, TranscodeError) as exc:
             dest.unlink(missing_ok=True)
             raise ContentError(f"{video.name}: {exc}") from exc
         log.info("media for %s: original %s | upload %s", video.name, before.describe(), after.describe())
-        self._prepared[video.id] = (prepared, after, [original, prepared])
+        files = [original, prepared]
+        where = self._stream_of.get(video.id)
+        if where and self.app.brands[where[0]].streams[where[1]].cover == "random_frame":
+            cover = pick_cover(prepared, after.duration_s, self.work_dir)
+            if cover is not None:
+                self._covers[video.id] = cover
+                files.append(cover.image_path)
+            else:
+                log.warning("no cover frame for %s; platforms use their default cover", video.name)
+        self._prepared[video.id] = (prepared, after, files)
         return prepared
+
+    def cover(self, video: VideoItem) -> Cover | None:
+        """The random cover frame chosen when the video was fetched (None when the stream has no cover rule)."""
+        return self._covers.get(video.id)
+
+    def frame_style_for(self, video: VideoItem) -> FrameStyle | None:
+        where = self._stream_of.get(video.id)
+        cfg = self.app.brands[where[0]].streams[where[1]].frame if where else None
+        if cfg is None:
+            return None
+        return FrameStyle(logo=resolve_asset(cfg.logo), credit=cfg.credit, font=resolve_asset(cfg.font),
+                          bg=cfg.bg, navy=cfg.navy, gold=cfg.gold, crf=cfg.crf, preset=self.encode.preset,
+                          audio_bitrate="160k")
 
     def encode_for(self, video: VideoItem) -> EncodeSettings:
         where = self._stream_of.get(video.id)
@@ -315,6 +545,7 @@ class DriveContent:
 
     def release(self, video: VideoItem) -> None:
         _, _, files = self._prepared.pop(video.id, (None, None, []))
+        self._covers.pop(video.id, None)
         for f in {*files, *([Path(video.local_path)] if video.local_path else [])}:
             if f.exists():
                 f.unlink()
@@ -341,6 +572,9 @@ class DriveContent:
             title = title_from_filename(video.name, src.strip_prefixes, src.replacements)
             if not title:
                 raise ContentError(f"empty title from file name {video.name!r}")
+            verdict = self.verdict(brand, video)
+            if verdict is not None:
+                title = verdict.title
             return TextChoice(variables={"title": title})
         row = choose_next_row(self.sheet_rows(brand), self.state.caption_cursor(brand), src.start_row)
         return TextChoice(variables=dict(row.values), row=row.number)
