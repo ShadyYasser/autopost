@@ -6,7 +6,9 @@ from argparse import Namespace
 import pytest
 
 from autopost.alerts.telegram import Notifier
+from autopost.config import AudioCheckConfig
 from autopost.control import OFFSET, PAUSED, Controller
+from autopost.title_guard import BackendError
 
 from test_audio_check import setup
 
@@ -223,3 +225,57 @@ def test_every_platform_caption_credits_moaz_with_the_title_first():
         body = texts.get("text") or texts["description"]
         assert body.startswith("قراءة في موضوع") and "#معاذ_عليان" in body and "#كلمة_سواء" in body
     assert render(brand.templates["facebook"], "facebook", {"title": "x"}, app.settings.text_limits)["text"].count("#") <= 5
+
+
+# ------------------------------------------------------------------ topical hashtags from the speech
+
+def test_clean_tags_keeps_only_grounded_well_formed_new_tags():
+    from autopost.title_guard import clean_tags
+
+    source = "قراءة في إنجيل يوحنا والثالوث المقدس  الكتاب المقدس"
+    raw = ["#الثالوث", "إنجيل يوحنا", "معاذ_عليان", "الثالوث", "موضوع_غير_مذكور", "x", "الكتاب المقدس!", "كلمة_سواء"]
+    assert clean_tags(raw, source, 5) == ["الثالوث", "إنجيل_يوحنا", "الكتاب_المقدس"]
+    assert clean_tags(raw, source, 2) == ["الثالوث", "إنجيل_يوحنا"]
+    assert clean_tags("not a list", source, 2) == [] and clean_tags(None, source, 2) == []
+    assert clean_tags(["الإنجيل"], "قراءه في الانجيل", 2) == ["الإنجيل"]            # spelling variants fold together
+
+
+def test_the_caption_gets_topical_hashtags_after_the_fixed_ones(app, tmp_path):
+    from autopost.content.text import render
+
+    content, state, _, backend, transcriber, _ = setup(app, tmp_path, texts={"m3": "كلام عن الثالوث وإنجيل يوحنا بالتفصيل"})
+    backend.tags = ["الثالوث", "إنجيل_يوحنا", "شيء_غير_موجود"]
+    video = content.next_video("kalima_sawaa", "short")
+    assert video.id == "m3" and content.cached_tags("kalima_sawaa", video) == ["الثالوث", "إنجيل_يوحنا"]
+    variables = content.pick_text("kalima_sawaa", "short", video).variables
+    assert variables["tags"] == " #الثالوث #إنجيل_يوحنا"
+    brand = app.brands["kalima_sawaa"]
+    text = render(brand.templates["tiktok"], "tiktok", variables, app.settings.text_limits)["text"]
+    assert text.endswith("#معاذ_عليان #كلمة_سواء #حوار_الأديان #الثالوث #إنجيل_يوحنا")
+    before = [c for c in backend.calls if c[0] == "tags"]
+    content.next_video("kalima_sawaa", "short")
+    assert [c for c in backend.calls if c[0] == "tags"] == before and transcriber.calls == ["m3"]
+    assert content.checked("kalima_sawaa", "short", video)
+
+
+def test_a_hashtag_failure_never_stops_a_post(app, tmp_path):
+    content, _, _, backend, _, _ = setup(app, tmp_path)
+    complete = backend.complete
+
+    def fails_on_tags(system, user, max_tokens=500):
+        if "hashtags" in system:
+            raise BackendError("HTTP 500", retryable=False)
+        return complete(system, user, max_tokens)
+
+    backend.complete = fails_on_tags
+    video = content.next_video("kalima_sawaa", "short")
+    assert video.id == "m3" and content.cached_tags("kalima_sawaa", video) is None
+    assert "tags" not in content.pick_text("kalima_sawaa", "short", video).variables or \
+        content.pick_text("kalima_sawaa", "short", video).variables["tags"] == ""
+
+
+def test_hashtags_can_be_switched_off_and_never_apply_without_the_audio_check(app, tmp_path):
+    content, *_ = setup(app, tmp_path, audio=AudioCheckConfig(streams=["short"], hashtags=0))
+    assert content.tags_wanted("kalima_sawaa", "short") == 0
+    content, *_ = setup(app, tmp_path / "b", audio=AudioCheckConfig(streams=["long"]))
+    assert content.tags_wanted("kalima_sawaa", "short") == 0
