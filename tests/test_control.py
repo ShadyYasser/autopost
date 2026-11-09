@@ -209,3 +209,17 @@ def test_a_publishing_runs_stale_copy_never_undoes_a_telegram_control(tmp_path):
     assert State(tmp_path / "m.db").kv_get(PAUSED) == ""
     merge_states(tmp_path / "t.db", tmp_path / "o.db", tmp_path / "m2.db", kv_ours_prefixes=("ctl:",))
     assert State(tmp_path / "m2.db").kv_get(PAUSED) == "1"      # the control job itself wins
+
+
+def test_every_platform_caption_credits_moaz_with_the_title_first():
+    from autopost.config import load_config
+    from autopost.content.text import render
+    from pathlib import Path
+
+    app = load_config(Path(__file__).resolve().parent.parent / "config")
+    brand = app.brands["kalima_sawaa"]
+    for platform in ("facebook", "instagram", "tiktok", "youtube"):
+        texts = render(brand.templates[platform], platform, {"title": "قراءة في موضوع"}, app.settings.text_limits)
+        body = texts.get("text") or texts["description"]
+        assert body.startswith("قراءة في موضوع") and "#معاذ_عليان" in body and "#كلمة_سواء" in body
+    assert render(brand.templates["facebook"], "facebook", {"title": "x"}, app.settings.text_limits)["text"].count("#") <= 5

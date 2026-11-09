@@ -169,7 +169,7 @@ def test_kalima_night_posts_short_and_long(app, tmp_path):
     assert by_stream["long"] == {"youtube": "direct", "facebook": "direct"}
     assert by_stream["short"]["youtube"] == "buffer"
     texts = next(c[5] for c in pub.calls if c[1] == "long" and c[2] == "youtube")
-    assert texts["title"] == texts["description"]
+    assert texts["description"].startswith(texts["title"]) and "معاذ عليان" in texts["description"]
 
 
 def test_failed_platform_is_retried_on_later_runs_then_given_up(app, tmp_path):
@@ -308,7 +308,7 @@ def test_early_test_deliveries_are_skipped_and_texts_reused(app, tmp_path):
     runner.run()
     platforms = sorted(c[2] for c in pub.calls)
     assert platforms == ["pinterest", "tiktok", "youtube"]
-    assert all(c[5].get("title", c[5].get("text")) == "from the test" for c in pub.calls)
+    assert all(c[5].get("title", c[5].get("text")).startswith("from the test") for c in pub.calls)
     post = state.posts_for_slot("kalima_sawaa", TZ_DAY, "morning")[0]
     d = {x.platform: x for x in state.deliveries(post["id"])}
     assert d["facebook"].status == "sent" and d["facebook"].url == "https://fb/1"
