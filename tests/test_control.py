@@ -209,3 +209,29 @@ def test_a_publishing_runs_stale_copy_never_undoes_a_telegram_control(tmp_path):
     assert State(tmp_path / "m.db").kv_get(PAUSED) == ""
     merge_states(tmp_path / "t.db", tmp_path / "o.db", tmp_path / "m2.db", kv_ours_prefixes=("ctl:",))
     assert State(tmp_path / "m2.db").kv_get(PAUSED) == "1"      # the control job itself wins
+
+
+# ------------------------------------------------------------------ comments report (read-only)
+
+def test_comments_report_counts_pages_and_follows_cursors():
+    from autopost.comments import facebook_totals, instagram_totals
+
+    class G:
+        def __init__(self, pages):
+            self.pages, self.calls = pages, []
+
+        def call(self, method, path, params=None, **kw):
+            assert method == "GET"
+            self.calls.append(dict(params))
+            return self.pages[len(self.calls) - 1]
+
+    g = G([{"data": [{"id": "a", "created_time": "2026-11-01T10:00:00", "comments": {"summary": {"total_count": 7}}},
+                     {"id": "b", "created_time": "2026-10-30T10:00:00"}],
+            "paging": {"cursors": {"after": "C1"}, "next": "x"}},
+           {"data": [{"id": "c", "created_time": "2026-10-01T10:00:00", "comments": {"summary": {"total_count": 3}}}],
+            "paging": {"cursors": {"after": "C2"}}}])
+    t = facebook_totals(g, "PAGE", 100)
+    assert (t["posts"], t["with_comments"], t["comments"], t["oldest"]) == (3, 2, 10, "2026-10-01")
+    assert t["top"][0] == (7, "a") and g.calls[1]["after"] == "C1" and len(g.calls) == 2
+    ig = instagram_totals(G([{"data": [{"id": "m", "timestamp": "2026-11-02T00:00:00", "comments_count": 4}]}]), "IG", 100)
+    assert ig["comments"] == 4

@@ -13,7 +13,7 @@ on:
       command:
         description: "What to run"
         type: choice
-        options: [run, test-post, check, meta-info, sources, validate, plan, status]
+        options: [run, test-post, check, meta-info, sources, validate, plan, status, comments-report]
         default: run
       brand:
         description: "Only this brand id (empty = all)"
@@ -127,6 +127,7 @@ jobs:
               [ -n "$VIDEO" ] && args+=(--video "$VIDEO")
               ;;
             check) args+=(--ping-telegram) ;;
+            comments-report) args+=(--brand "$BRAND") ;;
             meta-info) args+=(--brand "$BRAND" --platform "$PLATFORM" --id "$VIDEO") ;;
             sources) [ -n "$BRAND" ] && args+=(--brand "$BRAND") ;;
             validate) args+=(--check-secrets) ;;
