@@ -475,6 +475,8 @@ class OverlayConfig(_Model):
     dir: str = "assets/kalima_sawaa/overlays"
     opacity: float = Field(0.1, gt=0, le=0.6)
     blend: Literal["screen", "lighten", "addition", "softlight", "overlay"] = "screen"
+    # the middle of the picture, where the speaker is, is kept completely free of the effect
+    protect_center: float = Field(0.45, ge=0.0, le=0.9)
 
 
 class ProgressConfig(_Model):
@@ -485,6 +487,15 @@ class ProgressConfig(_Model):
     glow: int = Field(6, ge=0, le=40)
 
 
+class OutroConfig(_Model):
+    """A closing clip played after the reel (a logo animation). It is sped up when the reel is long, and
+    left out when even the fastest version would push the post past `max_total_seconds`."""
+    enabled: bool = True
+    path: str = "assets/kalima_sawaa/outro.mp4"
+    max_total_seconds: float = Field(178.0, ge=10)
+    max_speed: float = Field(2.5, ge=1.0, le=4.0)
+
+
 class EditsConfig(_Model):
     """Edits applied while the video is framed; no text is ever added to the picture. All of them need
     `frame`. `hook` and `zoom` are cut from the reel itself and additionally need the audio check on the
@@ -493,6 +504,7 @@ class EditsConfig(_Model):
     zoom: ZoomConfig | None = None
     overlay: OverlayConfig | None = None
     progress: ProgressConfig | None = None
+    outro: OutroConfig | None = None
 
 
 class AudioCheckConfig(_Model):
@@ -703,6 +715,8 @@ def validate_brand(brand: BrandConfig, settings: Settings) -> list[str]:
                               f"(their times come from the transcript)")
             if e.overlay and e.overlay.enabled and not resolve_asset(e.overlay.dir).is_dir():
                 errors.append(f"{sp}: edits.overlay folder not found: {e.overlay.dir}")
+            if e.outro and e.outro.enabled and not resolve_asset(e.outro.path).is_file():
+                errors.append(f"{sp}: edits.outro file not found: {e.outro.path}")
         for slot in stream.slots:
             if slot not in brand.slots:
                 errors.append(f"{sp}: unknown slot {slot!r} (defined: {sorted(brand.slots)})")

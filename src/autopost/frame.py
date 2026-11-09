@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .edits import EditPlan, ProgressStyle
 from . import progress as prog
-from .media import MediaInfo, TranscodeError
+from .media import MediaInfo, ProbeError, TranscodeError, probe
 
 log = logging.getLogger(__name__)
 
@@ -150,8 +150,9 @@ def render_layer(style: FrameStyle, rect: tuple[int, int, int, int]):
 
 def input_order(plan: EditPlan) -> dict[str, int]:
     """Which ffmpeg input index each piece gets. The order here is the order `render_video` passes them in."""
-    order = ["src"] + (["hook"] if plan.hook else []) + (["overlay"] if plan.overlay else [])
-    order += (["ring"] if plan.progress else []) + ["layer"]
+    order = ["src"] + (["hook"] if plan.hook else [])
+    order += ["overlay", "mask"] if plan.overlay else []
+    order += (["outro"] if plan.outro else []) + (["ring"] if plan.progress else []) + ["layer"]
     return {name: i for i, name in enumerate(order)}
 
 
@@ -164,22 +165,42 @@ def ring_geometry(style: FrameStyle, rect: tuple[int, int, int, int], ps: Progre
             pad + style.border / 2, style.radius + style.border // 2)
 
 
+def render_protect_mask(size: tuple[int, int], clear: float, power: float = 1.7):
+    """Grey image that multiplies a decorative overlay: black over the middle `clear` of the picture, where
+    the speaker is, ramping to white at the edges. Keeps any clip - ours or one the user dropped in - off
+    the face and off any text burned into the reel."""
+    import numpy as np
+    from PIL import Image
+
+    w, h = size
+    if clear <= 0:
+        return Image.new("RGB", (w, h), (255, 255, 255))      # no protection: the effect covers everything
+    ys = np.linspace(-1.0, 1.0, h, dtype=np.float32)[:, None]
+    xs = np.linspace(-1.0, 1.0, w, dtype=np.float32)[None, :]
+    r = np.sqrt(xs ** 2 + ys ** 2) / np.sqrt(2.0)
+    t = np.clip((r - clear) / max(1e-3, 1.0 - clear), 0.0, 1.0) ** power
+    return Image.fromarray((t * 255).astype(np.uint8), mode="L").convert("RGB")
+
+
 def frame_filter(style: FrameStyle, rect: tuple[int, int, int, int], plan: EditPlan | None = None,
-                 audio: bool = True, ring: "prog.ProgressSpec | None" = None) -> str:
-    """The filter graph. Outputs [out] and, with a cold open on a source that has sound, [aout]."""
+                 audio: bool = True, ring: "prog.ProgressSpec | None" = None,
+                 outro_audio: bool = False) -> str:
+    """The filter graph. Outputs [out], plus [aout] when the audio had to be cut together."""
     x, y, w, h = rect
     plan = plan or EditPlan()
     idx = input_order(plan)
     base = f"scale={w}:{h}:flags=lanczos,setsar=1,fps={style.fps},format=yuv420p"
     zw, zh = _even(w * plan.zoom_factor), _even(h * plan.zoom_factor)
     punch = f"scale={zw}:{zh}:flags=lanczos,setsar=1,fps={style.fps},format=yuv420p,crop={w}:{h}"
+    afmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+    cut_audio = audio and (plan.hook is not None or plan.outro is not None)
     parts = []
 
     if plan.zoom:
         # the punched-in copy lies over the normal one only during the zoom spans (hard cuts, like an edit)
         on = "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in plan.zoom)
         parts.append(f"[0:v]{base},split[n0][n1];[n1]scale={zw}:{zh}:flags=lanczos,crop={w}:{h}[z];"
-                     f"[n0][z]overlay=0:0:enable='{on}'[main]")
+                     f"[n0][z]overlay=0:0:enable=\'{on}\'[main]")
     else:
         parts.append(f"[0:v]{base}[main]")
 
@@ -187,21 +208,48 @@ def frame_filter(style: FrameStyle, rect: tuple[int, int, int, int], plan: EditP
         # the opening sentence is shown punched in (when zoom is on), so the reel's own start reads as a cut
         parts.append(f"[{idx['hook']}:v]{punch if plan.zoom else base},setpts=PTS-STARTPTS[hook]")
         if audio:
-            fmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
-            parts.append(f"[{idx['hook']}:a:0]{fmt},asetpts=PTS-STARTPTS,afade=t=in:d=0.06,"
-                         f"afade=t=out:st={max(0.0, plan.hook_seconds - 0.1):.2f}:d=0.1[ha];[0:a:0]{fmt}[ma];"
-                         f"[hook][ha][main][ma]concat=n=2:v=1:a=1[cut][aout]")
+            parts.append(f"[{idx['hook']}:a:0]{afmt},asetpts=PTS-STARTPTS,afade=t=in:d=0.06,"
+                         f"afade=t=out:st={max(0.0, plan.hook_seconds - 0.1):.2f}:d=0.1[ha];[0:a:0]{afmt}[ma];"
+                         f"[hook][ha][main][ma]concat=n=2:v=1:a=1[cut][ba]")
         else:
             parts.append("[hook][main]concat=n=2:v=1:a=0[cut]")
     else:
         parts.append("[main]null[cut]")
+        if cut_audio:
+            parts.append(f"[0:a:0]{afmt}[ba]")
 
     if plan.overlay is not None:
+        # both blends run on planar RGB: `screen` on YUV would lift the colour difference planes too and
+        # tint the whole picture. The mask keeps the effect away from the middle.
         o = plan.overlay
-        parts.append(f"[{idx['overlay']}:v]{base},setsar=1[ovl];"
-                     f"[cut][ovl]blend=all_mode={o.blend}:all_opacity={o.opacity:.3f}:shortest=1[vid]")
+        parts.append(f"[{idx['overlay']}:v]scale={w}:{h}:flags=lanczos,setsar=1,fps={style.fps},format=gbrp[ov];"
+                     f"[{idx['mask']}:v]scale={w}:{h}:flags=lanczos,setsar=1,fps={style.fps},format=gbrp[mk];"
+                     f"[ov][mk]blend=all_mode=multiply:shortest=1[ovm];[cut]format=gbrp[cutr];"
+                     f"[cutr][ovm]blend=all_mode={o.blend}:all_opacity={o.opacity:.3f}:shortest=1,"
+                     f"format=yuv420p[body]")
     else:
-        parts.append("[cut]null[vid]")
+        parts.append("[cut]null[body]")
+
+    if plan.outro is not None:
+        speed = plan.outro.speed
+        pts = f",setpts=PTS/{speed:.4f}" if abs(speed - 1.0) > 1e-3 else ""
+        parts.append(f"[{idx['outro']}:v]scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=decrease,"
+                     f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={style.bg.replace('#', '0x')},setsar=1,"
+                     f"fps={style.fps},format=yuv420p{pts},setpts=PTS-STARTPTS[otv]")
+        if audio:
+            if outro_audio:
+                tempo = f",atempo={speed:.4f}" if abs(speed - 1.0) > 1e-3 else ""
+                parts.append(f"[{idx['outro']}:a:0]{afmt}{tempo},asetpts=PTS-STARTPTS[oa]")
+            else:
+                parts.append(f"anullsrc=channel_layout=stereo:sample_rate=48000:"
+                             f"d={plan.outro.seconds:.3f}[oa]")
+            parts.append("[body][ba][otv][oa]concat=n=2:v=1:a=1[vid][aout]")
+        else:
+            parts.append("[body][otv]concat=n=2:v=1:a=0[vid]")
+    else:
+        parts.append("[body]null[vid]")
+        if cut_audio:
+            parts.append("[ba]anull[aout]")
 
     parts.append(f"color=c={style.bg.replace('#', '0x')}:s={style.width}x{style.height}:r={style.fps},"
                  f"format=yuv420p[bg];[bg][vid]overlay={x}:{y}:shortest=1[comp];"
@@ -221,34 +269,46 @@ def frame_filter(style: FrameStyle, rect: tuple[int, int, int, int], plan: EditP
 
 def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_dir: Path,
                  timeout_seconds: int = 3600, plan: EditPlan | None = None) -> Path:
-    """Re-encode `src` inside the frame into `out` (one ffmpeg pass). `plan` adds the cold open, the zoom cuts,
-    the decorative overlay clip and the progress ring."""
+    """Re-encode `src` inside the frame into `out` (one ffmpeg pass). `plan` adds the cold open, the zoom
+    cuts, the decorative overlay clip, the progress ring and the closing logo clip."""
     rect = video_rect(style, info.width, info.height)
     plan = plan or EditPlan()
     layer_path = work_dir / f"{src.stem}.frame.png"
     render_layer(style, rect).save(layer_path)
+    mask_path = work_dir / f"{src.stem}.mask.png"
     ring_dir = work_dir / f"{src.stem}.ring"
     ring = None
-    out_duration = info.duration_s + plan.hook_seconds
+    content_seconds = info.duration_s + plan.hook_seconds      # the ring closes with the reel, not the logo
     if plan.progress is not None:
         offset, size, inset, radius = ring_geometry(style, rect, plan.progress)
         ring = prog.render_sequence(ring_dir, size, inset, radius, plan.progress.width, plan.progress.glow,
-                                    prog.step_count(out_duration), out_duration, plan.progress.color, offset)
+                                    prog.step_count(content_seconds), content_seconds, plan.progress.color,
+                                    offset)
 
     inputs = ["-i", str(src)]
     if plan.hook is not None:
         inputs += ["-ss", f"{plan.hook[0]:.3f}", "-t", f"{plan.hook_seconds:.3f}", "-i", str(src)]
     if plan.overlay is not None:
-        inputs += ["-stream_loop", "-1", "-i", str(plan.overlay.path)]
+        render_protect_mask((rect[2], rect[3]), plan.overlay.protect_center).save(mask_path)
+        inputs += ["-stream_loop", "-1", "-i", str(plan.overlay.path),
+                   "-framerate", str(style.fps), "-loop", "1", "-i", str(mask_path)]
+    outro_audio = False
+    if plan.outro is not None:
+        try:
+            outro_audio = probe(plan.outro.path).acodec is not None
+        except ProbeError:
+            outro_audio = False
+        inputs += ["-i", str(plan.outro.path)]
     if ring is not None:
         inputs += ["-framerate", str(ring.fps), "-i", str(ring.pattern)]
     inputs += ["-framerate", str(style.fps), "-loop", "1", "-i", str(layer_path)]
 
     has_audio = info.acodec is not None
-    audio_map = ["-map", "[aout]"] if (plan.hook is not None and has_audio) else ["-map", "0:a:0?"]
+    cut_audio = has_audio and (plan.hook is not None or plan.outro is not None)
+    audio_map = ["-map", "[aout]"] if cut_audio else ["-map", "0:a:0?"]
     gop = style.fps * 2
     cmd = ["ffmpeg", "-v", "error", "-y", *inputs,
-           "-filter_complex", frame_filter(style, rect, plan, has_audio, ring),
+           "-filter_complex", frame_filter(style, rect, plan, has_audio, ring, outro_audio),
            "-map", "[out]", *audio_map,
            "-c:v", "libx264", "-preset", style.preset, "-crf", str(style.crf), "-profile:v", "high",
            "-level:v", "4.1", "-pix_fmt", "yuv420p", "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
@@ -259,7 +319,9 @@ def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_
     notes = (f"; cold open {plan.hook[0]:.1f}-{plan.hook[1]:.1f}s" if plan.hook else "") + (
         f"; {len(plan.zoom)} zoom cut(s) x{plan.zoom_factor}" if plan.zoom else "") + (
         f"; overlay {plan.overlay.path.name} at {plan.overlay.opacity:.0%}" if plan.overlay else "") + (
-        "; progress ring" if ring else "")
+        "; progress ring" if ring else "") + (
+        f"; outro {plan.outro.path.name} x{plan.outro.speed:.2f} ({plan.outro.seconds:.1f}s)"
+        if plan.outro else "")
     log.info("framing %s: window %dx%d at (%d,%d) in %dx%d%s", src.name, rect[2], rect[3], rect[0], rect[1],
              style.width, style.height, notes)
     try:
@@ -269,6 +331,7 @@ def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_
         raise TranscodeError(f"ffmpeg (frame) timed out after {timeout_seconds}s") from exc
     finally:
         layer_path.unlink(missing_ok=True)
+        mask_path.unlink(missing_ok=True)
         shutil.rmtree(ring_dir, ignore_errors=True)
     if result.returncode != 0:
         out.unlink(missing_ok=True)

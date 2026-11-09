@@ -654,3 +654,57 @@ def test_the_real_config_turns_every_edit_on(app):
     e = app.brands["kalima_sawaa"].streams["short"].edits
     assert e.hook.enabled and e.zoom.enabled and e.overlay.enabled and e.progress.enabled
     assert e.overlay.opacity == 0.10 and e.overlay.blend == "screen"
+
+
+# ------------------------------------------------------------------ the closing logo clip
+
+from autopost.config import OutroConfig  # noqa: E402
+
+
+def outro_setup(app, tmp_path, **kw):
+    content, state, client, alerts = deco_setup(app, tmp_path, outro=OutroConfig(**kw))
+    v = client.files[SHORT][0]
+    content._stream_of[v.id] = ("kalima_sawaa", "short")
+    return content, v
+
+
+def test_a_short_reel_gets_the_outro_at_normal_speed(app, tmp_path):
+    content, v = outro_setup(app, tmp_path)
+    plan = content.edit_plan(v, 40.0)
+    assert plan.outro is not None and plan.outro.speed == 1.0
+    assert plan.outro.path.name == "outro.mp4" and plan.outro.seconds == pytest.approx(10, abs=0.5)
+
+
+def test_a_long_reel_speeds_the_outro_up_to_stay_under_the_limit(app, tmp_path):
+    content, v = outro_setup(app, tmp_path, max_total_seconds=100.0, max_speed=2.5)
+    plan = content.edit_plan(v, 95.0)                              # 5s left for a 10s clip
+    assert plan.outro.speed == pytest.approx(2.0, abs=0.05)
+    assert 95.0 + plan.outro.seconds <= 100.0
+
+
+def test_the_outro_is_left_out_when_even_the_fastest_version_would_not_fit(app, tmp_path):
+    content, v = outro_setup(app, tmp_path, max_total_seconds=100.0, max_speed=2.5)
+    assert content.edit_plan(v, 97.0).outro is None                # would need x3.3
+    assert content.edit_plan(v, 100.0).outro is None               # nothing left at all
+
+
+def test_the_cold_open_counts_towards_the_outro_budget(app, tmp_path):
+    content, v = outro_setup(app, tmp_path, max_total_seconds=60.0, max_speed=4.0)
+    without = content.edit_plan(v, 50.0).outro.speed
+    content.state.kv_set(content._hook_key("kalima_sawaa", v),
+                         json.dumps({"start": 20.0, "end": 25.0, "text": "جملة"}))
+    app.brands["kalima_sawaa"].streams["short"].edits.hook = HookConfig()
+    with_hook = content.edit_plan(v, 50.0)
+    assert with_hook.hook is not None and with_hook.outro.speed > without
+    assert 50.0 + with_hook.hook_seconds + with_hook.outro_seconds <= 60.0
+
+
+def test_a_missing_outro_file_is_logged_once_and_never_blocks_a_post(app, tmp_path):
+    content, v = outro_setup(app, tmp_path, path=str(tmp_path / "gone.mp4"))
+    assert content.edit_plan(v, 30.0).outro is None
+    assert content.edit_plan(v, 30.0).outro is None                # the failed probe is remembered
+
+
+def test_the_real_config_closes_every_reel_with_the_logo(app):
+    e = app.brands["kalima_sawaa"].streams["short"].edits
+    assert e.outro.enabled and e.outro.max_total_seconds == 178 and e.overlay.protect_center == 0.45

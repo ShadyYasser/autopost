@@ -76,6 +76,9 @@ streams:
       overlay: { enabled: true, dir: "assets/kalima_sawaa/overlays", opacity: 0.10, blend: screen }
       # A brighter line that travels around the window and closes exactly as the reel ends.
       progress: { enabled: true, color: "#ffd98a", width: 9, glow: 6 }
+      # The logo animation closes every reel; it is sped up to keep the post under 178s, and left out when
+      # even x2.5 would not fit.
+      outro: { enabled: true, path: "assets/kalima_sawaa/outro.mp4", max_total_seconds: 178, max_speed: 2.5 }
     cover: random_frame        # cover/thumbnail = a random good frame (Instagram + TikTok/YouTube via Buffer)
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
   long:

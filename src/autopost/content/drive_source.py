@@ -15,6 +15,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -25,8 +26,8 @@ from zoneinfo import ZoneInfo
 
 from ..config import AppConfig, FilenameTextSource, SheetTextSource, resolve_asset
 from ..cover import Cover, pick_cover
-from ..edits import (EditPlan, HookRules, OverlaySpec, ProgressStyle, Segment, hook_candidates, hook_window,
-                     segments_from_json, segments_to_json, zoom_windows)
+from ..edits import (EditPlan, HookRules, OutroSpec, OverlaySpec, ProgressStyle, Segment, hook_candidates,
+                     hook_window, segments_from_json, segments_to_json, zoom_windows)
 from ..frame import FrameStyle, render_video
 from ..media import EncodeSettings, MediaInfo, ProbeError, TranscodeError, from_drive, prepare_for_upload, probe
 from ..state import State
@@ -188,6 +189,7 @@ class DriveContent:
         self._transcribers: dict[str, Transcriber] = {}
         self._covers: dict[str, Cover] = {}
         self._overlays: dict[Path, list[Path]] = {}
+        self._outros: dict[Path, float | None] = {}
         self.state = state
         self.client = client
         self.work_dir = work_dir
@@ -457,7 +459,33 @@ class DriveContent:
             return None
         e = self.edits_for(brand, stream).overlay
         n = video.tg_msg_id if video.tg_msg_id is not None else int(hashlib.sha1(video.id.encode()).hexdigest()[:8], 16)
-        return OverlaySpec(files[n % len(files)], opacity=e.opacity, blend=e.blend)
+        return OverlaySpec(files[n % len(files)], opacity=e.opacity, blend=e.blend,
+                           protect_center=e.protect_center)
+
+    def outro_for(self, brand: str, stream: str, body_seconds: float) -> OutroSpec | None:
+        """The closing clip, sped up by as much as it takes to stay under the length limit. None when the
+        reel is already so long that even the fastest version would not fit, or the file cannot be read."""
+        e = self.edits_for(brand, stream)
+        if e is None or e.outro is None or not e.outro.enabled:
+            return None
+        path = resolve_asset(e.outro.path)
+        if path not in self._outros:
+            try:
+                self._outros[path] = probe(path).duration_s
+            except ProbeError as exc:
+                log.warning("outro %s unusable, reels go out without it: %s", path, exc)
+                self._outros[path] = None
+        duration = self._outros[path]
+        if not duration:
+            return None
+        available = e.outro.max_total_seconds - body_seconds
+        if available <= 0.5:
+            return None
+        speed = max(1.0, duration / available)
+        if speed > e.outro.max_speed:
+            log.info("no outro on this reel: it would need x%.2f to fit", speed)
+            return None
+        return OutroSpec(path, duration, math.ceil(speed * 1000) / 1000)   # round up: never over the limit
 
     def plan_edits(self, brand: str, stream: str, video: VideoItem) -> None:
         """Prepare what `fetch` needs for the cuts: the timed segments and the model's choice of an opening
@@ -516,8 +544,10 @@ class DriveContent:
         progress = None
         if e.progress and e.progress.enabled:
             progress = ProgressStyle(color=e.progress.color, width=e.progress.width, glow=e.progress.glow)
+        body = duration + (hook[1] - hook[0] if hook else 0.0)
         plan = EditPlan(hook=hook, zoom=zoom, zoom_factor=e.zoom.factor if e.zoom else 1.0,
-                        overlay=self.overlay_for(brand, stream, video), progress=progress)
+                        overlay=self.overlay_for(brand, stream, video), progress=progress,
+                        outro=self.outro_for(brand, stream, body))
         return plan if plan else None
 
     def audio_verdict(self, brand: str, stream: str, video: VideoItem) -> AudioVerdict:
@@ -765,13 +795,14 @@ class DriveContent:
         dest = self.work_dir / f"{video.id}{suffix}"
         log.info("downloading %s (%s)", video.name, _size(video.size))
         style = self.frame_style_for(video)
+        plan = None
         try:
             original = self.client.download(video.id, dest, video.size)
             if style is not None:
                 before = probe(original)
+                plan = self.edit_plan(video, before.duration_s)
                 prepared = render_video(original, self.work_dir / f"{video.id}.framed.mp4", style, before,
-                                        self.work_dir, self.encode.timeout_seconds,
-                                        plan=self.edit_plan(video, before.duration_s))
+                                        self.work_dir, self.encode.timeout_seconds, plan=plan)
                 after = probe(prepared)
             else:
                 prepared, before, after = prepare_for_upload(original, self.work_dir, self.encode_for(video))
@@ -782,7 +813,9 @@ class DriveContent:
         files = [original, prepared]
         where = self._stream_of.get(video.id)
         if where and self.app.brands[where[0]].streams[where[1]].cover == "random_frame":
-            cover = pick_cover(prepared, after.duration_s, self.work_dir)
+            # the closing logo clip is not the reel: the cover frame must come from what Moaz filmed
+            content_seconds = max(1.0, after.duration_s - (plan.outro_seconds if plan else 0.0))
+            cover = pick_cover(prepared, content_seconds, self.work_dir)
             if cover is not None:
                 self._covers[video.id] = cover
                 files.append(cover.image_path)

@@ -84,6 +84,19 @@ class OverlaySpec:
     path: Path
     opacity: float = 0.1
     blend: str = "screen"
+    protect_center: float = 0.45     # fraction of the picture kept completely free of the effect
+
+
+@dataclass(frozen=True)
+class OutroSpec:
+    """A closing clip (a logo animation) played after the reel, sped up when it would not otherwise fit."""
+    path: Path
+    duration: float
+    speed: float = 1.0
+
+    @property
+    def seconds(self) -> float:
+        return self.duration / self.speed
 
 
 @dataclass(frozen=True)
@@ -101,11 +114,16 @@ class EditPlan:
     zoom_factor: float = 1.07
     overlay: OverlaySpec | None = None
     progress: ProgressStyle | None = None
+    outro: OutroSpec | None = None
 
     def __bool__(self) -> bool:
         return (self.hook is not None or bool(self.zoom) or self.overlay is not None
-                or self.progress is not None)
+                or self.progress is not None or self.outro is not None)
 
     @property
     def hook_seconds(self) -> float:
         return (self.hook[1] - self.hook[0]) if self.hook else 0.0
+
+    @property
+    def outro_seconds(self) -> float:
+        return self.outro.seconds if self.outro else 0.0

@@ -189,24 +189,29 @@ def test_render_with_cold_open_on_a_video_without_sound(tmp_path):
 
 # ------------------------------------------------------------------ overlay clip + progress ring
 
-from autopost.edits import OverlaySpec, ProgressStyle  # noqa: E402
+from autopost.edits import OutroSpec, OverlaySpec, ProgressStyle  # noqa: E402
 from autopost.frame import input_order, ring_geometry  # noqa: E402
 from autopost.progress import path_points, render_sequence, step_count, sweep_angles  # noqa: E402
 
 OVERLAY = ROOT / "assets/kalima_sawaa/overlays/embers.mp4"
+OUTRO = ROOT / "assets/kalima_sawaa/outro.mp4"
 
 
 def test_input_order_matches_what_render_video_passes():
     assert input_order(EditPlan()) == {"src": 0, "layer": 1}
-    full = EditPlan(hook=(1, 2), overlay=OverlaySpec(OVERLAY), progress=ProgressStyle())
-    assert input_order(full) == {"src": 0, "hook": 1, "overlay": 2, "ring": 3, "layer": 4}
+    full = EditPlan(hook=(1, 2), overlay=OverlaySpec(OVERLAY), progress=ProgressStyle(),
+                    outro=OutroSpec(OUTRO, 10.0))
+    assert input_order(full) == {"src": 0, "hook": 1, "overlay": 2, "mask": 3, "outro": 4, "ring": 5,
+                                 "layer": 6}
     assert input_order(EditPlan(progress=ProgressStyle())) == {"src": 0, "ring": 1, "layer": 2}
+    assert input_order(EditPlan(overlay=OverlaySpec(OVERLAY))) == {"src": 0, "overlay": 1, "mask": 2, "layer": 3}
 
 
 def test_filter_blends_the_overlay_and_draws_the_ring():
     s, rect = style(), video_rect(style(), 720, 1280)
     graph = frame_filter(s, rect, EditPlan(overlay=OverlaySpec(OVERLAY, opacity=0.12, blend="screen")))
-    assert "blend=all_mode=screen:all_opacity=0.120" in graph and "[1:v]scale=" in graph
+    assert "blend=all_mode=screen:all_opacity=0.120" in graph and "blend=all_mode=multiply" in graph
+    assert "format=gbrp" in graph and "[1:v]scale=" in graph and "[2:v]scale=" in graph
     assert "alphamerge" not in frame_filter(s, rect, EditPlan(progress=ProgressStyle()), ring=None)
 
 
@@ -276,3 +281,83 @@ def test_the_ring_is_brighter_at_the_end_than_at_the_start(tmp_path):
                         "-vf", f"crop={rw}:30:{ox}:{oy}", str(shot)], check=True)   # the top edge of the ring
         lit.append(np.asarray(Image.open(shot).convert("L"), dtype=np.float32).mean())
     assert lit[1] > lit[0] + 2                                             # the lap closed over the top edge
+
+
+# ------------------------------------------------------------------ protect mask + closing logo clip
+
+from autopost.frame import render_protect_mask  # noqa: E402
+
+
+def test_the_protect_mask_blacks_out_the_middle_and_opens_up_at_the_edges():
+    import numpy as np
+
+    m = np.asarray(render_protect_mask((400, 700), 0.45).convert("L"), dtype=np.float32)
+    assert m[350, 200] == 0                                            # dead centre: no effect at all
+    assert m[0, 0] > 230 and m[-1, -1] > 230                           # corners: full effect
+    rows = [m[350, 200 + d] for d in range(0, 200, 20)]
+    assert rows == sorted(rows)                                        # never gets darker on the way out
+    wide = np.asarray(render_protect_mask((400, 700), 0.1).convert("L"), dtype=np.float32)
+    assert wide[350, 380] > m[350, 380]                                # a smaller guard opens up sooner
+    off = np.asarray(render_protect_mask((40, 40), 0.0).convert("L"), dtype=np.float32)
+    assert (off == 255).all()                                          # 0 = no protection anywhere
+
+
+def test_the_outro_is_concatenated_and_gets_silence_when_it_has_none():
+    s, rect = style(), video_rect(style(), 720, 1280)
+    plan = EditPlan(outro=OutroSpec(OUTRO, 10.0, 2.0))
+    graph = frame_filter(s, rect, plan, audio=True, outro_audio=False)
+    assert "setpts=PTS/2.0000" in graph and "anullsrc" in graph and "d=5.000" in graph
+    assert "concat=n=2:v=1:a=1[vid][aout]" in graph
+    heard = frame_filter(s, rect, plan, audio=True, outro_audio=True)
+    assert "anullsrc" not in heard and "atempo=2.0000" in heard
+    silent = frame_filter(s, rect, plan, audio=False)
+    assert "concat=n=2:v=1:a=0[vid]" in silent and "aout" not in silent
+
+
+def test_an_outro_at_normal_speed_is_not_resampled():
+    graph = frame_filter(style(), video_rect(style(), 720, 1280), EditPlan(outro=OutroSpec(OUTRO, 4.0, 1.0)))
+    assert "setpts=PTS/" not in graph and "atempo" not in graph
+
+
+@needs_ffmpeg
+def test_render_appends_the_sped_up_outro(tmp_path):
+    src = make_video(tmp_path / "in.mp4", seconds=5)
+    out = render_video(src, tmp_path / "out.mp4", style(preset="ultrafast"), probe(src), tmp_path,
+                       plan=EditPlan(outro=OutroSpec(OUTRO, probe(OUTRO).duration_s, 2.0)))
+    info = probe(out)
+    assert info.duration_s == pytest.approx(5 + probe(OUTRO).duration_s / 2, abs=0.4)
+    assert (info.width, info.height, info.acodec) == (1080, 1920, "aac")
+
+
+@needs_ffmpeg
+def test_the_overlay_never_touches_the_middle_and_adds_no_colour_cast(tmp_path):
+    """A pure black overlay clip must change nothing: `screen` run on YUV would shift the colour planes
+    even where the clip is black, tinting the whole reel."""
+    import numpy as np
+    from PIL import Image
+
+    src, black = tmp_path / "flat.mp4", tmp_path / "black.mp4"
+    for path, color in ((src, "0x808080"), (black, "black")):
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={color}:s=720x1280:d=4",
+                        "-c:v", "libx264", "-crf", "10", "-pix_fmt", "yuv420p", str(path)], check=True)
+    rect = video_rect(style(), 720, 1280)
+
+    def render(name, plan):
+        return render_video(src, tmp_path / f"{name}.mp4", style(preset="ultrafast", crf=12), probe(src),
+                            tmp_path, plan=plan)
+
+    def area(video, x, y):
+        shot = tmp_path / f"{video.stem}-{x}.png"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", "2", "-i", str(video), "-frames:v", "1",
+                        "-vf", f"crop=140:140:{x}:{y}", str(shot)], check=True)
+        return np.asarray(Image.open(shot).convert("RGB"), dtype=np.float32).reshape(-1, 3).mean(axis=0)
+
+    plain = render("plain", None)
+    guarded = render("guarded", EditPlan(overlay=OverlaySpec(OVERLAY, opacity=0.1, protect_center=0.45)))
+    cx, cy = rect[0] + rect[2] // 2 - 70, rect[1] + rect[3] // 2 - 70
+    assert np.abs(area(guarded, cx, cy) - area(plain, cx, cy)).max() < 1.5      # the speaker's area is safe
+
+    dark = render("dark", EditPlan(overlay=OverlaySpec(black, opacity=0.3, protect_center=0.0)))
+    corner = (rect[0] + 20, rect[1] + 20)
+    before, after = area(plain, *corner), area(dark, *corner)
+    assert np.abs(after - before).max() < 2                                    # no lift and no colour cast
