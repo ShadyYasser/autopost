@@ -231,7 +231,8 @@ class DriveContent:
     def unused(self, brand: str, stream: str) -> list[VideoItem]:
         used = self.state.used_source_ids(brand, stream)
         return [v for v in self.listing(brand, stream)
-                if v.id not in used and not self.skipped_title(brand, stream, v) and not self.held_back(brand, v, stream)]
+                if v.id not in used and not self.skipped_title(brand, stream, v) and not self.held_back(brand, v, stream)
+                and not self.state.kv_get(f"ctl:skip:{v.id}")]
 
     # ------------------------------------------------------------ title check
 

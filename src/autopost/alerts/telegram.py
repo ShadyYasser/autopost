@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +32,15 @@ class Notifier:
         self.session = session or requests.Session()
         self.sent: list[str] = []          # what was (or would have been) sent in this run
 
-    def send(self, text: str) -> bool:
+    @staticmethod
+    def _markup(buttons: list[list[tuple[str, str]]] | None) -> str | None:
+        """Inline keyboard: rows of (label, callback_data); callback_data is at most 64 bytes."""
+        if not buttons:
+            return None
+        return json.dumps({"inline_keyboard": [[{"text": label, "callback_data": data} for label, data in row]
+                                               for row in buttons]}, ensure_ascii=False)
+
+    def send(self, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> bool:
         if len(text) > MAX_TEXT:
             text = text[: MAX_TEXT - 1] + "…"
         self.sent.append(text)
@@ -41,7 +50,8 @@ class Notifier:
         try:
             resp = self.session.post(
                 API.format(token=self.token, method="sendMessage"),
-                data={"chat_id": self.chat_id, "text": text, "disable_web_page_preview": "true"},
+                data={"chat_id": self.chat_id, "text": text, "disable_web_page_preview": "true",
+                      **({"reply_markup": self._markup(buttons)} if buttons else {})},
                 timeout=30,
             )
             if resp.status_code != 200:
@@ -64,6 +74,32 @@ class Notifier:
             log.error("telegram %s failed: HTTP %s %s", method, resp.status_code, resp.text[:300])
             return None
         return resp.json()
+
+    # -- bot control (buttons): used by `telegram-control`, a no-op in dry-run -------------------------------
+
+    def get_updates(self, offset: int, timeout: int) -> list[dict] | None:
+        """New updates (messages and button presses); None on an API error."""
+        if self.dry_run:
+            return []
+        data = {"offset": offset, "timeout": timeout, "allowed_updates": json.dumps(["message", "callback_query"])}
+        resp = self._post("getUpdates", data, timeout=timeout + 15)
+        return None if resp is None else resp.get("result", [])
+
+    def answer_callback(self, callback_id: str, text: str = "") -> None:
+        if not self.dry_run:
+            self._post("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:200]})
+
+    def edit(self, message_id: int, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> bool:
+        """Replace a message's text (and buttons; none removes them)."""
+        if self.dry_run:
+            self.sent.append(text)
+            return True
+        data = {"chat_id": self.chat_id, "message_id": message_id, "text": text[:MAX_TEXT],
+                "disable_web_page_preview": "true"}
+        markup = self._markup(buttons)
+        if markup:
+            data["reply_markup"] = markup
+        return self._post("editMessageText", data) is not None
 
     def get_me(self) -> str | None:
         """Bot username if the token works (for `check`)."""

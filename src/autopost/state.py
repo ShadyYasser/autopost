@@ -380,7 +380,8 @@ def merge_states(theirs: str | Path, ours: str | Path, out: str | Path,
 
     kv rows: ours wins. With `kv_ours_prefixes` (a job that only writes keys with those prefixes, such
     as the prescreen job, whose copy of every other key may be stale) ours only wins for those keys and
-    fills gaps for the others; theirs keeps its value.
+    fills gaps for the others; theirs keeps its value. `ctl:` keys (set from Telegram) always keep theirs
+    unless `ctl:` is one of the prefixes: a publishing run's copy of them may be stale.
     """
     import shutil
 
@@ -449,7 +450,12 @@ def merge_states(theirs: str | Path, ours: str | Path, out: str | Path,
         if dst.execute("INSERT OR IGNORE INTO alerts_sent VALUES (?,?)", tuple(r)).rowcount:
             bump("alerts_sent")
     for r in src.execute("SELECT * FROM kv"):
-        if kv_ours_prefixes is None or str(r["key"]).startswith(kv_ours_prefixes):
+        key = str(r["key"])
+        if key.startswith("ctl:") and not (kv_ours_prefixes and "ctl:" in kv_ours_prefixes):
+            ours_wins = False          # Telegram controls (pause, skip): only the control job overwrites them
+        else:
+            ours_wins = kv_ours_prefixes is None or key.startswith(kv_ours_prefixes)
+        if ours_wins:
             dst.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", tuple(r))
         else:
             dst.execute("INSERT OR IGNORE INTO kv VALUES (?,?)", tuple(r))

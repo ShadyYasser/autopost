@@ -1,0 +1,48 @@
+name: telegram-control
+
+# Listens to the Telegram bot for a few minutes at a time: /menu with "publish now" / "skip" buttons, /pause, /resume.
+# The automatic schedule (publish.yml) is untouched; this only adds manual control on top of it.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # commit state/state.db (skip / pause flags)
+  actions: write    # start publish.yml for "publish now"
+
+# One listener at a time; a newer one waits for the running one instead of cancelling it.
+concurrency:
+  group: autopost-control
+  cancel-in-progress: false
+
+jobs:
+  listen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PYTHONUNBUFFERED: "1"
+      SECRETS_JSON: ${{ toJSON(secrets) }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Listen
+        run: python -m autopost telegram-control --max-minutes 4.5
+
+      - name: Commit state
+        if: always()
+        env:
+          AUTOPOST_KV_OURS_PREFIXES: "ctl:"
+        run: bash scripts/commit_state.sh "telegram control ${{ github.run_id }}"
