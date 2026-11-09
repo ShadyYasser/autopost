@@ -25,8 +25,8 @@ from zoneinfo import ZoneInfo
 
 from ..config import AppConfig, FilenameTextSource, SheetTextSource, resolve_asset
 from ..cover import Cover, pick_cover
-from ..edits import (EditPlan, HookRules, Segment, hook_candidates, hook_window, segments_from_json,
-                     segments_to_json, zoom_windows)
+from ..edits import (EditPlan, HookRules, OverlaySpec, ProgressStyle, Segment, hook_candidates, hook_window,
+                     segments_from_json, segments_to_json, zoom_windows)
 from ..frame import FrameStyle, render_video
 from ..media import EncodeSettings, MediaInfo, ProbeError, TranscodeError, from_drive, prepare_for_upload, probe
 from ..state import State
@@ -40,6 +40,7 @@ from ..transcribe import TranscribeError, Transcriber, WhisperSettings
 
 log = logging.getLogger(__name__)
 
+VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 POSTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
 _PARSE_FORMATS = (POSTED_AT_FORMAT, "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y")
 
@@ -186,6 +187,7 @@ class DriveContent:
         self._local_backends: dict[tuple[str, str, int], LocalBackend] = {}
         self._transcribers: dict[str, Transcriber] = {}
         self._covers: dict[str, Cover] = {}
+        self._overlays: dict[Path, list[Path]] = {}
         self.state = state
         self.client = client
         self.work_dir = work_dir
@@ -404,12 +406,20 @@ class DriveContent:
     # ------------------------------------------------------------ edits (cold open, zoom cuts)
 
     def edits_for(self, brand: str, stream: str):
+        """The stream's edits config, or None when it has none (they all need the frame)."""
         cfg = self.app.brands[brand].streams[stream]
-        return cfg.edits if (cfg.edits and cfg.frame and self.audio_on(brand, stream)) else None
+        return cfg.edits if (cfg.edits and cfg.frame) else None
+
+    def cuts_wanted(self, brand: str, stream: str) -> bool:
+        """True when a cold open or zoom cuts are on: those are the edits that need the transcript's times."""
+        e = self.edits_for(brand, stream)
+        if e is None or not self.audio_on(brand, stream):
+            return False
+        return bool((e.hook and e.hook.enabled) or (e.zoom and e.zoom.enabled))
 
     def hook_wanted(self, brand: str, stream: str) -> HookRules | None:
         e = self.edits_for(brand, stream)
-        if e is None or e.hook is None or not e.hook.enabled:
+        if e is None or e.hook is None or not e.hook.enabled or not self.audio_on(brand, stream):
             return None
         return HookRules(min_seconds=e.hook.min_seconds, max_seconds=e.hook.max_seconds,
                          skip_first_seconds=e.hook.skip_first_seconds)
@@ -425,10 +435,34 @@ class DriveContent:
         except (ValueError, KeyError, TypeError):
             return None
 
+    def overlay_files(self, brand: str, stream: str) -> list[Path]:
+        """The decorative clips of this stream, in a stable order ([] when the feature is off or the folder
+        is empty, which simply means no overlay)."""
+        e = self.edits_for(brand, stream)
+        if e is None or e.overlay is None or not e.overlay.enabled:
+            return []
+        folder = resolve_asset(e.overlay.dir)
+        if folder not in self._overlays:
+            files = sorted(f for f in folder.glob("*") if f.suffix.lower() in VIDEO_SUFFIXES) if folder.is_dir() else []
+            self._overlays[folder] = files
+            if not files:
+                log.warning("no overlay clips in %s; reels are framed without one", folder)
+        return self._overlays[folder]
+
+    def overlay_for(self, brand: str, stream: str, video: VideoItem) -> OverlaySpec | None:
+        """One clip per reel, the next one each time: Telegram message ids count up reel by reel, so
+        neighbouring reels never get the same clip. Files without one fall back to their Drive id."""
+        files = self.overlay_files(brand, stream)
+        if not files:
+            return None
+        e = self.edits_for(brand, stream).overlay
+        n = video.tg_msg_id if video.tg_msg_id is not None else int(hashlib.sha1(video.id.encode()).hexdigest()[:8], 16)
+        return OverlaySpec(files[n % len(files)], opacity=e.opacity, blend=e.blend)
+
     def plan_edits(self, brand: str, stream: str, video: VideoItem) -> None:
-        """Prepare what `fetch` needs for the edits: the timed segments and the model's choice of an opening
+        """Prepare what `fetch` needs for the cuts: the timed segments and the model's choice of an opening
         sentence, both cached. Cosmetic: any failure is logged and the reel goes out without the edit."""
-        if self.edits_for(brand, stream) is None:
+        if not self.cuts_wanted(brand, stream):
             return
         try:
             segments = self.segments(brand, video)
@@ -455,7 +489,7 @@ class DriveContent:
                  f"{chosen.start:.1f}-{chosen.end:.1f}s «{chosen.text}»" if chosen else "none")
 
     def edits_planned(self, brand: str, stream: str, video: VideoItem) -> bool:
-        if self.edits_for(brand, stream) is None:
+        if not self.cuts_wanted(brand, stream):
             return True
         if self.cached_segments(brand, video) is None:
             return False
@@ -468,16 +502,22 @@ class DriveContent:
         if e is None:
             return None
         brand, stream = where
-        segments = [s for s in (self.cached_segments(brand, video) or []) if s.start < duration]
-        hook = None
-        rules = self.hook_wanted(brand, stream)
-        chosen = self.cached_hook(brand, video) if rules else None
-        if chosen:
-            start, end = hook_window(chosen, rules, duration)
-            if end - start >= rules.min_seconds and duration + (end - start) <= e.hook.max_total_seconds:
-                hook = (start, end)
-        zoom = zoom_windows(segments, duration, e.zoom.min_shot_seconds) if (e.zoom and e.zoom.enabled) else []
-        plan = EditPlan(hook=hook, zoom=zoom, zoom_factor=e.zoom.factor if e.zoom else 1.0)
+        hook, zoom = None, []
+        if self.cuts_wanted(brand, stream):
+            segments = [s for s in (self.cached_segments(brand, video) or []) if s.start < duration]
+            rules = self.hook_wanted(brand, stream)
+            chosen = self.cached_hook(brand, video) if rules else None
+            if chosen:
+                start, end = hook_window(chosen, rules, duration)
+                if end - start >= rules.min_seconds and duration + (end - start) <= e.hook.max_total_seconds:
+                    hook = (start, end)
+            if e.zoom and e.zoom.enabled:
+                zoom = zoom_windows(segments, duration, e.zoom.min_shot_seconds)
+        progress = None
+        if e.progress and e.progress.enabled:
+            progress = ProgressStyle(color=e.progress.color, width=e.progress.width, glow=e.progress.glow)
+        plan = EditPlan(hook=hook, zoom=zoom, zoom_factor=e.zoom.factor if e.zoom else 1.0,
+                        overlay=self.overlay_for(brand, stream, video), progress=progress)
         return plan if plan else None
 
     def audio_verdict(self, brand: str, stream: str, video: VideoItem) -> AudioVerdict:

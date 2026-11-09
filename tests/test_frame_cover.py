@@ -185,3 +185,94 @@ def test_render_with_cold_open_on_a_video_without_sound(tmp_path):
                        plan=EditPlan(hook=(3.0, 5.0)))
     info = probe(out)
     assert info.acodec is None and info.duration_s == pytest.approx(8, abs=0.4)
+
+
+# ------------------------------------------------------------------ overlay clip + progress ring
+
+from autopost.edits import OverlaySpec, ProgressStyle  # noqa: E402
+from autopost.frame import input_order, ring_geometry  # noqa: E402
+from autopost.progress import path_points, render_sequence, step_count, sweep_angles  # noqa: E402
+
+OVERLAY = ROOT / "assets/kalima_sawaa/overlays/embers.mp4"
+
+
+def test_input_order_matches_what_render_video_passes():
+    assert input_order(EditPlan()) == {"src": 0, "layer": 1}
+    full = EditPlan(hook=(1, 2), overlay=OverlaySpec(OVERLAY), progress=ProgressStyle())
+    assert input_order(full) == {"src": 0, "hook": 1, "overlay": 2, "ring": 3, "layer": 4}
+    assert input_order(EditPlan(progress=ProgressStyle())) == {"src": 0, "ring": 1, "layer": 2}
+
+
+def test_filter_blends_the_overlay_and_draws_the_ring():
+    s, rect = style(), video_rect(style(), 720, 1280)
+    graph = frame_filter(s, rect, EditPlan(overlay=OverlaySpec(OVERLAY, opacity=0.12, blend="screen")))
+    assert "blend=all_mode=screen:all_opacity=0.120" in graph and "[1:v]scale=" in graph
+    assert "alphamerge" not in frame_filter(s, rect, EditPlan(progress=ProgressStyle()), ring=None)
+
+
+def test_ring_sits_on_the_border_and_stays_inside_the_frame():
+    s = style()
+    for vw, vh in ((720, 1280), (1920, 1080), (1080, 1080)):
+        rect = video_rect(s, vw, vh)
+        (ox, oy), (rw, rh), inset, radius = ring_geometry(s, rect, ProgressStyle())
+        assert ox >= 0 and oy >= 0 and ox + rw <= s.width and oy + rh <= s.height
+        assert inset > 0 and radius >= s.radius
+        assert (ox + rw // 2, oy + rh // 2) == (rect[0] + rect[2] // 2, rect[1] + rect[3] // 2)   # centred
+
+
+def test_the_sweep_moves_at_a_steady_speed_along_the_path():
+    size, inset, radius = (900, 1500), 24.0, 42
+    angles = sweep_angles(size, inset, radius, 200)
+    assert angles[0] > -90 and angles[-1] == 270 and angles == sorted(angles)
+    # quarter of the path length -> the middle of the long right side, which is due east of the centre
+    assert angles[49] == pytest.approx(0, abs=4) and angles[99] == pytest.approx(90, abs=4)
+    assert angles[149] == pytest.approx(180, abs=4)
+    pts = path_points(size, inset, radius)
+    assert pts[0] == pts[-1] == (size[0] / 2, inset)                      # a closed lap from the top middle
+
+
+def test_ring_frames_only_ever_light_up_more_of_the_same_ring(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    spec = render_sequence(tmp_path / "ring", (300, 500), 12, 20, 5, 3, 12, 6.0, "#ffd98a")
+    assert spec.steps == 12 and spec.fps == 2 and spec.pattern.parent.is_dir()
+    frames = [np.asarray(Image.open(spec.pattern.parent / ("ring%05d.png" % i)), dtype=np.int16)
+              for i in range(1, 13)]
+    for a, b in zip(frames, frames[1:]):
+        assert (b >= a).all()                                              # never un-lights a pixel
+    assert frames[0].max() > 0 and frames[0].sum() < frames[-1].sum() / 4
+
+
+def test_step_count_is_bounded():
+    assert step_count(1) == 90 and step_count(40) == 400 and step_count(5000) == 600
+
+
+@needs_ffmpeg
+def test_render_with_overlay_and_ring_keeps_the_upload_spec(tmp_path):
+    src = make_video(tmp_path / "in.mp4", seconds=6)
+    plan = EditPlan(overlay=OverlaySpec(OVERLAY, opacity=0.1), progress=ProgressStyle())
+    out = render_video(src, tmp_path / "out.mp4", style(preset="ultrafast"), probe(src), tmp_path, plan=plan)
+    info = probe(out)
+    assert (info.width, info.height, info.vcodec, info.acodec) == (1080, 1920, "h264", "aac")
+    assert info.duration_s == pytest.approx(6, abs=0.4)
+    assert not list(tmp_path.glob("*.ring"))                               # the frame sequence is cleaned up
+
+
+@needs_ffmpeg
+def test_the_ring_is_brighter_at_the_end_than_at_the_start(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    src = make_video(tmp_path / "in.mp4", seconds=8, audio=False)
+    out = render_video(src, tmp_path / "out.mp4", style(preset="ultrafast"), probe(src), tmp_path,
+                       plan=EditPlan(progress=ProgressStyle()))
+    rect = video_rect(style(), 720, 1280)
+    (ox, oy), (rw, rh), _, _ = ring_geometry(style(), rect, ProgressStyle())
+    lit = []
+    for at in (0.2, 7.6):
+        shot = tmp_path / f"{at}.png"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(at), "-i", str(out), "-frames:v", "1",
+                        "-vf", f"crop={rw}:30:{ox}:{oy}", str(shot)], check=True)   # the top edge of the ring
+        lit.append(np.asarray(Image.open(shot).convert("L"), dtype=np.float32).mean())
+    assert lit[1] > lit[0] + 2                                             # the lap closed over the top edge

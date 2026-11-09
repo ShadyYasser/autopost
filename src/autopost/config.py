@@ -466,11 +466,33 @@ class ZoomConfig(_Model):
     min_shot_seconds: float = Field(4.0, ge=1, le=60)
 
 
+class OverlayConfig(_Model):
+    """A decorative clip blended over the picture at a low opacity; a different file per reel.
+
+    The files live in `dir` (any video ffmpeg reads). They are meant to be effects on a black background -
+    light leaks, sparks, a glowing border - because `screen` leaves black pixels untouched."""
+    enabled: bool = True
+    dir: str = "assets/kalima_sawaa/overlays"
+    opacity: float = Field(0.1, gt=0, le=0.6)
+    blend: Literal["screen", "lighten", "addition", "softlight", "overlay"] = "screen"
+
+
+class ProgressConfig(_Model):
+    """A brighter line that travels around the video window and closes as the reel ends."""
+    enabled: bool = True
+    color: str = "#ffd98a"
+    width: int = Field(9, ge=2, le=40)
+    glow: int = Field(6, ge=0, le=40)
+
+
 class EditsConfig(_Model):
-    """Edits cut from the reel itself (no text is added). Needs `frame` and the audio check on the stream:
-    the timestamps come from the Whisper transcript."""
+    """Edits applied while the video is framed; no text is ever added to the picture. All of them need
+    `frame`. `hook` and `zoom` are cut from the reel itself and additionally need the audio check on the
+    stream, because their timestamps come from the Whisper transcript."""
     hook: HookConfig | None = None
     zoom: ZoomConfig | None = None
+    overlay: OverlayConfig | None = None
+    progress: ProgressConfig | None = None
 
 
 class AudioCheckConfig(_Model):
@@ -672,10 +694,15 @@ def validate_brand(brand: BrandConfig, settings: Settings) -> list[str]:
                 if not resolve_asset(asset).exists():
                     errors.append(f"{sp}: frame {label} file not found: {asset}")
         if stream.edits:
+            e = stream.edits
             if not stream.frame:
                 errors.append(f"{sp}: `edits` needs `frame` (the edits are made while the video is framed)")
-            if not (brand.title_guard and brand.title_guard.enabled and brand.title_guard.audio_for(name)):
-                errors.append(f"{sp}: `edits` needs title_guard.audio on this stream (it uses the transcript's times)")
+            if (e.hook or e.zoom) and not (brand.title_guard and brand.title_guard.enabled
+                                           and brand.title_guard.audio_for(name)):
+                errors.append(f"{sp}: edits.hook/zoom need title_guard.audio on this stream "
+                              f"(their times come from the transcript)")
+            if e.overlay and e.overlay.enabled and not resolve_asset(e.overlay.dir).is_dir():
+                errors.append(f"{sp}: edits.overlay folder not found: {e.overlay.dir}")
         for slot in stream.slots:
             if slot not in brand.slots:
                 errors.append(f"{sp}: unknown slot {slot!r} (defined: {sorted(brand.slots)})")

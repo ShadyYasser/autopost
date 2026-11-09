@@ -585,3 +585,72 @@ def test_pick_hook_rejects_out_of_range_and_garbage():
     assert TitleGuard(backend=One('{"n": "none"}')).pick_hook("t", "x", ["a", "b"]) is None
     assert TitleGuard(backend=One('{"risk": "low"}')).pick_hook("t", "x", ["a", "b"]) is None
     assert TitleGuard(backend=One("{}")).pick_hook("t", "x", []) is None
+
+
+# ------------------------------------------------------------------ overlay clip + progress ring
+
+from autopost.config import OverlayConfig, ProgressConfig  # noqa: E402
+
+OVERLAY_DIR = "assets/kalima_sawaa/overlays"
+
+
+def deco_setup(app, tmp_path, n=4, **kw):
+    content, state, client, backend, _, alerts = setup(app, tmp_path, n=n)
+    app.brands["kalima_sawaa"].streams["short"].edits = EditsConfig(
+        overlay=OverlayConfig(dir=OVERLAY_DIR, opacity=0.12), progress=ProgressConfig(), **kw)
+    return content, state, client, alerts
+
+
+def test_neighbouring_reels_get_different_overlay_clips(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    files = content.overlay_files("kalima_sawaa", "short")
+    assert len(files) >= 3 and all(f.exists() for f in files)
+    picks = []
+    for v in client.files[SHORT]:
+        content._stream_of[v.id] = ("kalima_sawaa", "short")
+        spec = content.overlay_for("kalima_sawaa", "short", v)
+        assert spec.opacity == 0.12 and spec.blend == "screen"
+        picks.append(spec.path)
+    assert all(a != b for a, b in zip(picks, picks[1:]))                    # consecutive msg_ids, different clips
+    assert len(set(picks)) == len(files)                                    # every clip is used in turn
+
+
+def test_the_same_reel_always_gets_the_same_clip(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    v = client.files[SHORT][0]
+    content._stream_of[v.id] = ("kalima_sawaa", "short")
+    first = content.overlay_for("kalima_sawaa", "short", v).path
+    assert content.overlay_for("kalima_sawaa", "short", v).path == first
+
+
+def test_an_empty_or_missing_overlay_folder_simply_means_no_overlay(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    app.brands["kalima_sawaa"].streams["short"].edits.overlay = OverlayConfig(dir=str(tmp_path / "none"))
+    v = client.files[SHORT][0]
+    content._stream_of[v.id] = ("kalima_sawaa", "short")
+    assert content.overlay_for("kalima_sawaa", "short", v) is None
+    assert content.edit_plan(v, 30.0).progress is not None                  # the ring still applies
+
+
+def test_overlay_and_ring_work_without_the_audio_check(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    app.brands["kalima_sawaa"].title_guard.audio = None
+    v = client.files[SHORT][0]
+    content._stream_of[v.id] = ("kalima_sawaa", "short")
+    assert not content.cuts_wanted("kalima_sawaa", "short")
+    plan = content.edit_plan(v, 30.0)
+    assert plan.overlay is not None and plan.progress is not None and plan.hook is None and plan.zoom == []
+    assert content.edits_planned("kalima_sawaa", "short", v)                # nothing to prepare, nothing cached
+
+
+def test_decoration_only_edits_need_no_transcript(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    before = list(content._transcriber.calls) if content._transcriber else []
+    content.plan_edits("kalima_sawaa", "short", client.files[SHORT][0])
+    assert (content._transcriber.calls if content._transcriber else []) == before
+
+
+def test_the_real_config_turns_every_edit_on(app):
+    e = app.brands["kalima_sawaa"].streams["short"].edits
+    assert e.hook.enabled and e.zoom.enabled and e.overlay.enabled and e.progress.enabled
+    assert e.overlay.opacity == 0.10 and e.overlay.blend == "screen"

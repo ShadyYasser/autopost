@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -78,13 +79,32 @@ def zoom_windows(segments: list[Segment], duration: float, min_shot: float = 4.0
 
 
 @dataclass(frozen=True)
+class OverlaySpec:
+    """A decorative clip blended over the picture: black pixels of a `screen` overlay leave the reel untouched."""
+    path: Path
+    opacity: float = 0.1
+    blend: str = "screen"
+
+
+@dataclass(frozen=True)
+class ProgressStyle:
+    """The ring that closes around the video window as the reel ends."""
+    color: str = "#ffd98a"
+    width: int = 9
+    glow: int = 6
+
+
+@dataclass(frozen=True)
 class EditPlan:
     hook: tuple[float, float] | None = None                       # cut of the source that plays first
     zoom: list[tuple[float, float]] = field(default_factory=list)  # source spans shown punched in
     zoom_factor: float = 1.07
+    overlay: OverlaySpec | None = None
+    progress: ProgressStyle | None = None
 
     def __bool__(self) -> bool:
-        return self.hook is not None or bool(self.zoom)
+        return (self.hook is not None or bool(self.zoom) or self.overlay is not None
+                or self.progress is not None)
 
     @property
     def hook_seconds(self) -> float:
