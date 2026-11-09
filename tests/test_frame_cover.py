@@ -128,3 +128,60 @@ def test_drive_content_frames_the_video_and_picks_a_cover(app, tmp_path):
     assert cover is not None and cover.image_path.exists() and 1000 <= cover.offset_ms <= 4000
     content.release(video)
     assert content.cover(video) is None and not any(p.suffix in (".mp4", ".jpg") for p in (tmp_path / "media").iterdir())
+
+
+# ------------------------------------------------------------------ edits: cold open + zoom cuts
+
+from autopost.edits import (EditPlan, HookRules, Segment, hook_candidates, hook_window, segments_from_json,  # noqa: E402
+                            segments_to_json, zoom_windows)
+from autopost.frame import frame_filter  # noqa: E402
+
+SEGS = [Segment(0.0, 3.0, "مقدمة قصيرة عن الموضوع هنا"), Segment(3.2, 7.5, "كلام تمهيدي قبل السؤال الأساسي"),
+        Segment(9.0, 12.0, "هل النص ده معناه اللي بيتقال"), Segment(12.4, 13.0, "طيب"),
+        Segment(14.0, 24.0, "شرح طويل " * 8), Segment(25.0, 28.0, "وده الرد على السؤال اللي فات")]
+
+
+def test_hook_candidates_skip_the_start_short_long_and_tiny_segments():
+    picked = hook_candidates(SEGS, HookRules())
+    assert [s.start for s in picked] == [9.0, 25.0]
+    assert hook_window(picked[0], HookRules(), 30.0) == pytest.approx((8.92, 12.15))
+    assert hook_window(Segment(29.0, 29.95, "x"), HookRules(), 30.0)[1] == 30.0     # never past the end
+
+
+def test_zoom_windows_alternate_on_sentence_starts_and_respect_the_minimum_shot():
+    windows = zoom_windows(SEGS, 30.0, min_shot=4.0)
+    assert windows == [(9.0, 14.0), (25.0, 28.0)]            # cuts at 9, 14, 25: zoomed, normal, zoomed
+    assert zoom_windows([], 30.0) == [] and zoom_windows(SEGS[:1], 30.0) == []
+    for a, b in windows:
+        assert 0 < a < b <= 30.0
+
+
+def test_segments_round_trip_through_state_json():
+    assert segments_from_json(segments_to_json(SEGS)) == SEGS
+
+
+def test_filter_without_a_plan_has_no_extra_inputs():
+    rect = video_rect(style(), 720, 1280)
+    graph = frame_filter(style(), rect)
+    assert "[1:v]overlay" in graph and "concat" not in graph and "enable" not in graph
+    graph = frame_filter(style(), rect, EditPlan(hook=(9.0, 12.0), zoom=[(9.0, 14.0)]))
+    assert "[2:v]overlay" in graph and "concat=n=2:v=1:a=1" in graph and "between(t,9.00,14.00)" in graph
+
+
+@needs_ffmpeg
+def test_render_with_cold_open_and_zoom_is_longer_by_the_hook(tmp_path):
+    src = make_video(tmp_path / "in.mp4", seconds=8)
+    plan = EditPlan(hook=(5.0, 7.0), zoom=[(2.0, 4.0)], zoom_factor=1.1)
+    out = render_video(src, tmp_path / "out.mp4", style(preset="ultrafast"), probe(src), tmp_path, plan=plan)
+    info = probe(out)
+    assert (info.width, info.height, info.vcodec, info.acodec) == (1080, 1920, "h264", "aac")
+    assert info.duration_s == pytest.approx(10, abs=0.4)
+
+
+@needs_ffmpeg
+def test_render_with_cold_open_on_a_video_without_sound(tmp_path):
+    src = make_video(tmp_path / "in.mp4", seconds=6, audio=False)
+    out = render_video(src, tmp_path / "out.mp4", style(preset="ultrafast"), probe(src), tmp_path,
+                       plan=EditPlan(hook=(3.0, 5.0)))
+    info = probe(out)
+    assert info.acodec is None and info.duration_s == pytest.approx(8, abs=0.4)

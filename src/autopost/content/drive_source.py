@@ -25,6 +25,8 @@ from zoneinfo import ZoneInfo
 
 from ..config import AppConfig, FilenameTextSource, SheetTextSource, resolve_asset
 from ..cover import Cover, pick_cover
+from ..edits import (EditPlan, HookRules, Segment, hook_candidates, hook_window, segments_from_json,
+                     segments_to_json, zoom_windows)
 from ..frame import FrameStyle, render_video
 from ..media import EncodeSettings, MediaInfo, ProbeError, TranscodeError, from_drive, prepare_for_upload, probe
 from ..state import State
@@ -335,8 +337,10 @@ class DriveContent:
             return self._transcriber
         if brand not in self._transcribers:
             a = self.app.brands[brand].title_guard.audio
-            self._transcribers[brand] = Transcriber(WhisperSettings(model=a.whisper_model, compute_type=a.compute_type,
-                                                                    language=a.language, max_seconds=a.max_seconds))
+            timed = any(st.edits for st in self.app.brands[brand].streams.values())
+            self._transcribers[brand] = Transcriber(WhisperSettings(
+                model=a.whisper_model, compute_type=a.compute_type, language=a.language, max_seconds=a.max_seconds,
+                word_timestamps=timed))
         return self._transcribers[brand]
 
     def cached_audio(self, brand: str, video: VideoItem) -> AudioVerdict | None:
@@ -348,26 +352,133 @@ class DriveContent:
         except (ValueError, KeyError):
             return None
 
-    def transcript(self, brand: str, video: VideoItem) -> str:
-        """What is said in the first seconds of the video (cached in state, so a failed later step never costs
-        a second transcription). Downloads the original, transcribes it, deletes the download."""
-        key = self._text_key(brand, video)
-        cached = self.state.kv_get(key)
-        if cached is not None:
-            return cached
+    def _segs_key(self, brand: str, video: VideoItem) -> str:
+        return self._guard_key(brand, video)[0].replace("guard:", "audio:segs:", 1)
+
+    def _hook_key(self, brand: str, video: VideoItem) -> str:
+        return self._guard_key(brand, video)[0].replace("guard:", "guard:hook:", 1)
+
+    def _transcribe(self, brand: str, video: VideoItem) -> tuple[str, list[Segment]]:
+        """Download the original, transcribe it, delete the download; the text and its timed segments go to state."""
         suffix = Path(video.name).suffix.lower() or ".mp4"
         dest = self.work_dir / f"{video.id}.screen{suffix}"
+        transcriber = self.transcriber_for(brand)
         try:
             log.info("audio check: downloading %s (%s)", video.name, _size(video.size))
             self.client.download(video.id, dest, video.size)
-            text = self.transcriber_for(brand).transcribe(dest, self.work_dir)
+            timed = getattr(transcriber, "transcribe_segments", None)
+            text, segments = timed(dest, self.work_dir) if timed else (transcriber.transcribe(dest, self.work_dir), [])
         except (GoogleError, TranscribeError) as exc:
             raise ContentError(f"{video.name}: audio check failed: {exc}") from exc
         finally:
             dest.unlink(missing_ok=True)
         text = " ".join(text.split())[:MAX_TRANSCRIPT]
-        self.state.kv_set(key, text)
-        return text
+        if self.state.kv_get(self._text_key(brand, video)) is None:      # the judged text never changes afterwards
+            self.state.kv_set(self._text_key(brand, video), text)
+        self.state.kv_set(self._segs_key(brand, video), segments_to_json(segments))
+        return text, segments
+
+    def transcript(self, brand: str, video: VideoItem) -> str:
+        """What is said in the first seconds of the video (cached in state, so a failed later step never costs
+        a second transcription)."""
+        cached = self.state.kv_get(self._text_key(brand, video))
+        if cached is not None:
+            return cached
+        return self._transcribe(brand, video)[0]
+
+    def cached_segments(self, brand: str, video: VideoItem) -> list[Segment] | None:
+        raw = self.state.kv_get(self._segs_key(brand, video))
+        if raw is None:
+            return None
+        try:
+            return segments_from_json(raw)
+        except (ValueError, TypeError):
+            return None
+
+    def segments(self, brand: str, video: VideoItem) -> list[Segment]:
+        """The transcript's segments with their times (cached). A video transcribed before the edits were turned
+        on has only its text in state, so it is transcribed once more."""
+        cached = self.cached_segments(brand, video)
+        return cached if cached is not None else self._transcribe(brand, video)[1]
+
+    # ------------------------------------------------------------ edits (cold open, zoom cuts)
+
+    def edits_for(self, brand: str, stream: str):
+        cfg = self.app.brands[brand].streams[stream]
+        return cfg.edits if (cfg.edits and cfg.frame and self.audio_on(brand, stream)) else None
+
+    def hook_wanted(self, brand: str, stream: str) -> HookRules | None:
+        e = self.edits_for(brand, stream)
+        if e is None or e.hook is None or not e.hook.enabled:
+            return None
+        return HookRules(min_seconds=e.hook.min_seconds, max_seconds=e.hook.max_seconds,
+                         skip_first_seconds=e.hook.skip_first_seconds)
+
+    def cached_hook(self, brand: str, video: VideoItem) -> Segment | None | bool:
+        """The chosen opening sentence; None = decided that there is none; False = not decided yet."""
+        raw = self.state.kv_get(self._hook_key(brand, video))
+        if raw is None:
+            return False
+        try:
+            data = json.loads(raw)
+            return Segment(float(data["start"]), float(data["end"]), str(data["text"])) if data else None
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def plan_edits(self, brand: str, stream: str, video: VideoItem) -> None:
+        """Prepare what `fetch` needs for the edits: the timed segments and the model's choice of an opening
+        sentence, both cached. Cosmetic: any failure is logged and the reel goes out without the edit."""
+        if self.edits_for(brand, stream) is None:
+            return
+        try:
+            segments = self.segments(brand, video)
+        except ContentError as exc:
+            log.warning("edits for %s skipped: %s", video.name, exc)
+            return
+        rules = self.hook_wanted(brand, stream)
+        if rules is None or self.cached_hook(brand, video) is not False:
+            return
+        candidates = hook_candidates(segments, rules)
+        chosen: Segment | None = None
+        if candidates:
+            title = self._guard_key(brand, video)[1]
+            try:
+                index = self.guard_for(brand).pick_hook(title, self.transcript(brand, video),
+                                                        [c.text for c in candidates])
+            except GuardError as exc:
+                log.warning("cold open for %s skipped: %s", video.name, exc)
+                return                                   # not cached: the next run asks again
+            chosen = candidates[index] if index is not None else None
+        self.state.kv_set(self._hook_key(brand, video), json.dumps(
+            {"start": chosen.start, "end": chosen.end, "text": chosen.text} if chosen else {}, ensure_ascii=False))
+        log.info("cold open %s: %s", video.name,
+                 f"{chosen.start:.1f}-{chosen.end:.1f}s «{chosen.text}»" if chosen else "none")
+
+    def edits_planned(self, brand: str, stream: str, video: VideoItem) -> bool:
+        if self.edits_for(brand, stream) is None:
+            return True
+        if self.cached_segments(brand, video) is None:
+            return False
+        return self.hook_wanted(brand, stream) is None or self.cached_hook(brand, video) is not False
+
+    def edit_plan(self, video: VideoItem, duration: float) -> EditPlan | None:
+        """The edits of this video from what is cached in state (never calls a model, never transcribes)."""
+        where = self._stream_of.get(video.id)
+        e = self.edits_for(*where) if where else None
+        if e is None:
+            return None
+        brand, stream = where
+        segments = [s for s in (self.cached_segments(brand, video) or []) if s.start < duration]
+        hook = None
+        rules = self.hook_wanted(brand, stream)
+        chosen = self.cached_hook(brand, video) if rules else None
+        if chosen:
+            start, end = hook_window(chosen, rules, duration)
+            if end - start >= rules.min_seconds and duration + (end - start) <= e.hook.max_total_seconds:
+                hook = (start, end)
+        zoom = zoom_windows(segments, duration, e.zoom.min_shot_seconds) if (e.zoom and e.zoom.enabled) else []
+        plan = EditPlan(hook=hook, zoom=zoom, zoom_factor=e.zoom.factor if e.zoom else 1.0)
+        return plan if plan else None
 
     def audio_verdict(self, brand: str, stream: str, video: VideoItem) -> AudioVerdict:
         """What is said in the video, judged (cached in state). Any failure raises ContentError: nothing is
@@ -461,6 +572,7 @@ class DriveContent:
             if new.risk in cfg.block_levels:
                 return ("title", new.risk, verdict.original, new.reasons or verdict.reasons)
         self.topical_tags(brand, stream, video)
+        self.plan_edits(brand, stream, video)
         return None
 
     def checked(self, brand: str, stream: str, video: VideoItem) -> bool:
@@ -479,7 +591,9 @@ class DriveContent:
             return False
         if blocked and self.cached_retitle(brand, video) is None:
             return False
-        return not self.tags_wanted(brand, stream) or self.cached_tags(brand, video) is not None
+        if self.tags_wanted(brand, stream) and self.cached_tags(brand, video) is None:
+            return False
+        return self.edits_planned(brand, stream, video)
 
     def _alert_hold(self, brand: str, stream: str, video: VideoItem, what: str, risk: str, shown: str,
                     reasons: tuple[str, ...]) -> None:
@@ -616,7 +730,8 @@ class DriveContent:
             if style is not None:
                 before = probe(original)
                 prepared = render_video(original, self.work_dir / f"{video.id}.framed.mp4", style, before,
-                                        self.work_dir, self.encode.timeout_seconds)
+                                        self.work_dir, self.encode.timeout_seconds,
+                                        plan=self.edit_plan(video, before.duration_s))
                 after = probe(prepared)
             else:
                 prepared, before, after = prepare_for_upload(original, self.work_dir, self.encode_for(video))

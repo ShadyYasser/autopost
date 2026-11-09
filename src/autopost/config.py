@@ -444,6 +444,35 @@ class FrameConfig(_Model):
     crf: int = Field(18, ge=0, le=51)
 
 
+class HookConfig(_Model):
+    """Cold open: one complete sentence of the speaker, from later in the reel, plays before the reel."""
+    enabled: bool = True
+    min_seconds: float = Field(1.5, ge=0.5, le=10)
+    max_seconds: float = Field(6.0, ge=1, le=15)
+    skip_first_seconds: float = Field(8.0, ge=0, le=120)
+    max_total_seconds: float = Field(178.0, ge=10)    # no cold open when it would push the reel past this length
+
+    @model_validator(mode="after")
+    def _range(self) -> "HookConfig":
+        if self.max_seconds < self.min_seconds:
+            raise ValueError("hook.max_seconds is below hook.min_seconds")
+        return self
+
+
+class ZoomConfig(_Model):
+    """Zoom cuts: the picture alternates between normal and a light punch-in where a new sentence starts."""
+    enabled: bool = True
+    factor: float = Field(1.07, gt=1.0, le=1.3)
+    min_shot_seconds: float = Field(4.0, ge=1, le=60)
+
+
+class EditsConfig(_Model):
+    """Edits cut from the reel itself (no text is added). Needs `frame` and the audio check on the stream:
+    the timestamps come from the Whisper transcript."""
+    hook: HookConfig | None = None
+    zoom: ZoomConfig | None = None
+
+
 class AudioCheckConfig(_Model):
     """Judge what is said in a reel too: Whisper transcribes the first seconds, the same model judges the text."""
     enabled: bool = True
@@ -506,6 +535,7 @@ class StreamConfig(_Model):
     backfill: BackfillConfig | None = None
     media: StreamMediaConfig = Field(default_factory=StreamMediaConfig)
     frame: FrameConfig | None = None
+    edits: EditsConfig | None = None
     # random_frame: cover/thumbnail = a random good frame of the video (Instagram, and TikTok/YouTube via Buffer)
     cover: Literal["none", "random_frame"] = "none"
 
@@ -641,6 +671,11 @@ def validate_brand(brand: BrandConfig, settings: Settings) -> list[str]:
             for label, asset in (("logo", stream.frame.logo), ("font", stream.frame.font)):
                 if not resolve_asset(asset).exists():
                     errors.append(f"{sp}: frame {label} file not found: {asset}")
+        if stream.edits:
+            if not stream.frame:
+                errors.append(f"{sp}: `edits` needs `frame` (the edits are made while the video is framed)")
+            if not (brand.title_guard and brand.title_guard.enabled and brand.title_guard.audio_for(name)):
+                errors.append(f"{sp}: `edits` needs title_guard.audio on this stream (it uses the transcript's times)")
         for slot in stream.slots:
             if slot not in brand.slots:
                 errors.append(f"{sp}: unknown slot {slot!r} (defined: {sorted(brand.slots)})")

@@ -65,6 +65,12 @@ streams:
       upscale: false
     frame:                     # logo on top, the reel in a rounded window, source credit below (1080x1920)
       credit: "المصدر: معاذ عليان"
+    # Edits cut from the reel itself, so the upload is not a plain copy of the source (no text is added to the
+    # picture). Times come from the Whisper transcript of the audio check; the cold open sentence is chosen by
+    # the same language model, and a reel with no clearly suitable sentence simply gets none.
+    edits:
+      hook: { enabled: true, min_seconds: 1.5, max_seconds: 6, skip_first_seconds: 8 }   # cold open
+      zoom: { enabled: true, factor: 1.07, min_shot_seconds: 4 }                          # light punch-in cuts
     cover: random_frame        # cover/thumbnail = a random good frame (Instagram + TikTok/YouTube via Buffer)
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
   long:
