@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import logging
 import re
 import time
@@ -407,6 +408,41 @@ class DriveContent:
         log.info("retitle %s [%s]: %r → %r (%s)", video.name, new.risk, title, new.title, "; ".join(new.reasons))
         return new
 
+    def _tags_key(self, brand: str, video: VideoItem) -> str:
+        return self._guard_key(brand, video)[0].replace("guard:", "guard:tags:", 1)
+
+    def cached_tags(self, brand: str, video: VideoItem) -> list[str] | None:
+        raw = self.state.kv_get(self._tags_key(brand, video))
+        if raw is None:
+            return None
+        try:
+            return [str(t) for t in json.loads(raw)]
+        except ValueError:
+            return None
+
+    def tags_wanted(self, brand: str, stream: str) -> int:
+        cfg = self.app.brands[brand].title_guard
+        return cfg.audio_for(stream).hashtags if cfg and self.audio_on(brand, stream) and cfg.audio_for(stream) else 0
+
+    def topical_tags(self, brand: str, stream: str, video: VideoItem) -> list[str]:
+        """Hashtags about what the reel is about, from its transcript (cached). Cosmetic: a model failure is logged
+        and the reel simply goes out without them."""
+        count = self.tags_wanted(brand, stream)
+        if not count:
+            return []
+        cached = self.cached_tags(brand, video)
+        if cached is not None:
+            return cached
+        title = self._guard_key(brand, video)[1]
+        try:
+            tags = self.guard_for(brand).hashtags(title, self.transcript(brand, video), count)
+        except GuardError as exc:
+            log.warning("hashtags for %s skipped: %s", video.name, exc)
+            return []
+        self.state.kv_set(self._tags_key(brand, video), json.dumps(tags, ensure_ascii=False))
+        log.info("hashtags %s: %s", video.name, " ".join("#" + t for t in tags) or "(none)")
+        return tags
+
     def screen(self, brand: str, stream: str, video: VideoItem) -> tuple[str, str, str, tuple[str, ...]] | None:
         """Run every check this stream has. None: the video may be posted (a blocked title is replaced by a new
         one, see `retitle`). Otherwise (what, risk, text to show, reasons) of the check that holds it back."""
@@ -424,6 +460,7 @@ class DriveContent:
             new = self.retitle(brand, video)
             if new.risk in cfg.block_levels:
                 return ("title", new.risk, verdict.original, new.reasons or verdict.reasons)
+        self.topical_tags(brand, stream, video)
         return None
 
     def checked(self, brand: str, stream: str, video: VideoItem) -> bool:
@@ -440,7 +477,9 @@ class DriveContent:
             blocked = Verdict.from_json(raw).risk in cfg.block_levels
         except (ValueError, KeyError):
             return False
-        return not blocked or self.cached_retitle(brand, video) is not None
+        if blocked and self.cached_retitle(brand, video) is None:
+            return False
+        return not self.tags_wanted(brand, stream) or self.cached_tags(brand, video) is not None
 
     def _alert_hold(self, brand: str, stream: str, video: VideoItem, what: str, risk: str, shown: str,
                     reasons: tuple[str, ...]) -> None:
@@ -655,7 +694,10 @@ class DriveContent:
                     if new is None or new.risk in cfg.block_levels:
                         raise ContentError(f"{video.name}: the title is blocked and has no replacement")
                     title = new.title
-            return TextChoice(variables={"title": title})
+            variables = {"title": title}
+            if self.tags_wanted(brand, stream):
+                variables["tags"] = "".join(" #" + t for t in self.cached_tags(brand, video) or [])
+            return TextChoice(variables=variables)
         row = choose_next_row(self.sheet_rows(brand), self.state.caption_cursor(brand), src.start_row)
         return TextChoice(variables=dict(row.values), row=row.number)
 

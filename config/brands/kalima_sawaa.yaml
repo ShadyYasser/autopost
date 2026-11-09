@@ -82,10 +82,10 @@ streams:
 # Moaz Alyan is credited by name and with his hashtag on every platform (the frame credits him on the video).
 # Keep the hashtag set short: a few relevant tags read better than a long list.
 templates:
-  facebook:  { text: "{title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان" }
-  instagram: { text: "{title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان #مقارنة_الأديان" }
-  tiktok:    { text: "{title} #معاذ_عليان #كلمة_سواء #حوار_الأديان" }
-  youtube:   { title: "{title}", description: "{title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان #Shorts" }
+  facebook:  { text: "{title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان{tags}" }
+  instagram: { text: "{title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان #مقارنة_الأديان{tags}" }
+  tiktok:    { text: "{title} #معاذ_عليان #كلمة_سواء #حوار_الأديان{tags}" }
+  youtube:   { title: "{title}", description: "{title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان{tags} #Shorts" }
   pinterest: { title: "{title}", description: "{title}\n\nالمصدر: معاذ عليان" }
 
 platforms:

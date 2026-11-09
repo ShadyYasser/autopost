@@ -121,6 +121,51 @@ Reply with ONLY one JSON object, no other text:
 {{"title": "<new title>", "risk": "low|high", "reasons": ["<short English note on where the title came from>", ...]}}"""
 
 
+TAGS_SYSTEM_PROMPT = """You pick hashtags for short Arabic reels on the channel "كلمة سواء": an educational, \
+interfaith-dialogue page (Islam, Christianity and comparative religion).
+{context}
+You get one JSON object: {{"title": "...", "transcript": "..."}}; the transcript is automatic speech-to-text of spoken \
+Arabic and can contain recognition mistakes.
+
+Pick the {count} hashtags that best name the SUBJECT of the reel:
+- Arabic, one to three words joined by "_", for example "الثالوث" or "إنجيل_يوحنا" or "الكتاب_المقدس".
+- Each word must come from the title or from what is said; never invent a topic that is not discussed.
+- A topic, a book, a verse or a doctrine only: no insults, no slogans, no claims, no names of people, no names of \
+sects, no generic tags like "دين" or "فيديو".
+
+Reply with ONLY one JSON object, no other text:
+{{"tags": ["<tag>", ...]}}"""
+
+# hashtags the templates already carry, and words that never belong in a topical tag
+RESERVED_TAGS = {"معاذ_عليان", "كلمة_سواء", "حوار_الأديان", "مقارنة_الأديان", "shorts"}
+_TAG_CHARS = re.compile(r"[^\w]", re.UNICODE)
+_DIACRITICS = re.compile("[\u064b-\u065f\u0670\u0640]")
+
+
+def _fold(text: str) -> str:
+    """Arabic spelling variants folded together, so a tag is matched against the speech loosely."""
+    text = _DIACRITICS.sub("", text.lower())
+    for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي")):
+        text = text.replace(a, b)
+    return text
+
+
+def clean_tags(raw, source_text: str, limit: int) -> list[str]:
+    """Hashtags (without '#') that are well formed, not already in the templates and grounded in `source_text`:
+    every word of the tag has to occur in the title or the transcript."""
+    folded = _fold(source_text)
+    out: list[str] = []
+    for item in raw if isinstance(raw, list) else []:
+        tag = "_".join(_TAG_CHARS.sub(" ", str(item).replace("#", " ").replace("_", " ")).split())
+        words = tag.split("_")
+        if not (3 <= len(tag) <= 30 and len(words) <= 3) or tag in RESERVED_TAGS or tag in out:
+            continue
+        if any(len(w) < 2 or _fold(w) not in folded for w in words):
+            continue
+        out.append(tag)
+    return out[:limit]
+
+
 class GuardError(Exception):
     pass
 
@@ -336,6 +381,7 @@ class TitleGuard:
         self.system = SYSTEM_PROMPT.format(context=ctx)
         self.audio_system = AUDIO_SYSTEM_PROMPT.format(context=ctx)
         self.retitle_system = RETITLE_SYSTEM_PROMPT.format(context=ctx)
+        self._ctx = ctx
         self.sleep, self.attempts = sleep, attempts
 
     def _ask(self, system: str, user: str, max_tokens: int, what: str) -> str:
@@ -364,6 +410,15 @@ class TitleGuard:
                              ensure_ascii=False)
         text = self._ask(self.retitle_system, payload, 500, "retitle")
         return parse_retitle_reply(text, original)
+
+    def hashtags(self, title: str, transcript: str, count: int = 2) -> list[str]:
+        """Up to `count` topical hashtags (no '#') for a reel, each grounded in its title or transcript."""
+        transcript = " ".join(transcript.split())
+        if count <= 0 or len(transcript) < 8:
+            return []
+        payload = json.dumps({"title": title, "transcript": transcript[:MAX_TRANSCRIPT]}, ensure_ascii=False)
+        text = self._ask(TAGS_SYSTEM_PROMPT.format(context=self._ctx, count=count), payload, 200, "hashtags")
+        return clean_tags(_json_object(text).get("tags"), f"{title} {transcript}", count)
 
     def judge_audio(self, title: str, transcript: str) -> AudioVerdict:
         """Risk of what is said in the reel. An empty transcript (music, silence) is low risk without a model call."""

@@ -358,7 +358,7 @@ class FilenameTextSource(_Model):
     skip_titles: list[str] = Field(default_factory=list)
 
     def variables(self) -> set[str]:
-        return {"title"}
+        return {"title", "tags"}      # tags: " #topic #topic" from the speech, or "" (see DriveContent.pick_text)
 
 
 TextSource = Annotated[Union[SheetTextSource, FilenameTextSource], Field(discriminator="type")]
@@ -452,6 +452,7 @@ class AudioCheckConfig(_Model):
     compute_type: str = "int8"
     max_seconds: int = Field(180, ge=15, le=900)
     language: str = "ar"
+    hashtags: int = Field(2, ge=0, le=5)  # topical hashtags taken from what is said (0 = off)
 
 
 class TitleGuardConfig(_Model):

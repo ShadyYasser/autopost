@@ -37,9 +37,13 @@ class Scripted:
 
     def __init__(self, titles=None, audio=None, retitles=None):
         self.titles, self.audio, self.retitles, self.calls = titles or {}, audio or {}, retitles or {}, []
+        self.tags = []
 
     def complete(self, system, user, max_tokens=500):
         data = json.loads(user)
+        if "hashtags" in system:
+            self.calls.append(("tags", data["title"]))
+            return json.dumps({"tags": self.tags})
         if "original_title" in data:
             self.calls.append(("retitle", data["original_title"], data["transcript"]))
             return json.dumps(self.retitles.get(data["original_title"], {
