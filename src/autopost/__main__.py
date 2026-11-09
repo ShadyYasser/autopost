@@ -212,6 +212,10 @@ def _run(args, app: AppConfig) -> tuple[int, str]:
     secrets = Secrets()
     # Dry runs work on a throwaway copy of the state so nothing they do is ever committed.
     state, tmpdir = open_state(args.state, throwaway=dry)
+    if scheduled and not dry and state.kv_get("ctl:paused"):
+        log.info("automatic publishing is paused from Telegram: scheduled run publishes nothing")
+        state.close()
+        return 0, "paused from Telegram: housekeeping only"
     now = parse_now(args.now, app)
     if dry and not args.real_sleep:
         clock = SimClock(now or datetime.now(app.settings.tz))
@@ -746,6 +750,63 @@ def cmd_prescreen(args, app: AppConfig) -> int:
     return 1 if problems else 0
 
 
+def cmd_telegram_control(args, app: AppConfig) -> int:
+    """Listen for Telegram button presses and commands for a few minutes (see control.py).
+
+    Meant to be started every few minutes by control.yml; the changes it makes (`ctl:` keys) are committed to
+    the state as soon as they happen, so the scheduled publisher sees them at once."""
+    import subprocess
+    import time
+
+    from .control import OFFSET, Controller, github_dispatcher
+
+    secrets = Secrets()
+    notifier = make_notifier(app, secrets, dry_run=False)
+    if not (notifier.token and notifier.chat_id):
+        print("Telegram is not configured; nothing to listen to", file=sys.stderr)
+        return 1
+    state = State(args.state)
+    content = make_content(app, state, secrets, dry_run=True)       # read-only use of Drive
+    if not isinstance(content, DriveContent):
+        print("Google credentials missing", file=sys.stderr)
+        state.close()
+        return 1
+
+    def commit() -> None:
+        if os.environ.get("GITHUB_ACTIONS") != "true":
+            return
+        ctl.state.close()
+        subprocess.run(["bash", "scripts/commit_state.sh", "telegram control"], check=False,
+                       env={**os.environ, "AUTOPOST_KV_OURS_PREFIXES": "ctl:"})
+        ctl.state = content.state = State(args.state)               # the commit script may have reset the file
+
+    ctl = Controller(app, state, content, notifier, github_dispatcher(), on_change=commit)
+    deadline = time.monotonic() + args.max_minutes * 60
+    offset = int(ctl.state.kv_get(OFFSET) or 0)
+    failures = 0
+    try:
+        while True:
+            wait = min(25, int(deadline - time.monotonic()))
+            if wait < 1:
+                break
+            updates = notifier.get_updates(offset, wait)
+            if updates is None:                                     # e.g. 409: another consumer / a webhook is set
+                failures += 1
+                if failures >= 3:
+                    print("Telegram getUpdates keeps failing; stopping", file=sys.stderr)
+                    return 1
+                time.sleep(5)
+                continue
+            failures = 0
+            for update in updates:
+                offset = update["update_id"] + 1
+                ctl.state.kv_set(OFFSET, str(offset))
+                ctl.handle(update)
+    finally:
+        ctl.state.close()
+    return 0
+
+
 def cmd_merge_state(args, app: AppConfig) -> int:
     """Merge two state DBs (used by scripts/commit_state.sh on a push conflict)."""
     from .state import merge_states
@@ -810,6 +871,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-minutes", type=int, default=100, help="stop starting new checks after this long")
     p.add_argument("--dry-run", action="store_true", help="work on a throwaway copy of the state, send no alerts")
 
+    p = sub.add_parser("telegram-control", help="listen for Telegram buttons/commands (publish now, skip, pause)")
+    p.add_argument("--max-minutes", type=float, default=4.5, help="how long to listen")
+
     p = sub.add_parser("check", help="read-only credential checks (Telegram, Meta, Buffer/Pinterest secrets)")
     p.add_argument("--ping-telegram", action="store_true", help="also send a test message")
 
@@ -848,7 +912,7 @@ def main(argv: list[str] | None = None) -> int:
     use_clock_for_logs(app.settings.tz)
     try:
         return {"validate": cmd_validate, "plan": cmd_plan, "run": cmd_run, "sources": cmd_sources,
-                "prescreen": cmd_prescreen, "check": cmd_check, "test-post": cmd_test_post, "meta-info": cmd_meta_info, "merge-state": cmd_merge_state, "status": cmd_status}[args.command](
+                "prescreen": cmd_prescreen, "telegram-control": cmd_telegram_control, "check": cmd_check, "test-post": cmd_test_post, "meta-info": cmd_meta_info, "merge-state": cmd_merge_state, "status": cmd_status}[args.command](
             args, app)
     except (MissingSecret, GoogleError) as exc:
         print(str(exc), file=sys.stderr)
