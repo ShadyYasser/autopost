@@ -22,6 +22,7 @@ jobs:
     timeout-minutes: 8
     env:
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: src
       SECRETS_JSON: ${{ toJSON(secrets) }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
