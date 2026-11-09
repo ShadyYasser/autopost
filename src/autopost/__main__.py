@@ -807,6 +807,18 @@ def cmd_telegram_control(args, app: AppConfig) -> int:
     return 0
 
 
+def cmd_comments_report(args, app: AppConfig) -> int:
+    """Read-only: comment counts and comment permissions of a brand's Facebook page / Instagram account."""
+    from .comments import report
+
+    if args.brand not in app.brands:
+        print(f"unknown brand {args.brand!r}", file=sys.stderr)
+        return 2
+    for line in report(app, Secrets(), args.brand, args.max_posts):
+        print(line)
+    return 0
+
+
 def cmd_merge_state(args, app: AppConfig) -> int:
     """Merge two state DBs (used by scripts/commit_state.sh on a push conflict)."""
     from .state import merge_states
@@ -874,6 +886,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("telegram-control", help="listen for Telegram buttons/commands (publish now, skip, pause)")
     p.add_argument("--max-minutes", type=float, default=4.5, help="how long to listen")
 
+    p = sub.add_parser("comments-report", help="read-only: how many comments the Facebook/Instagram posts have")
+    p.add_argument("--brand", required=True)
+    p.add_argument("--max-posts", type=int, default=3000, help="newest posts to scan per platform")
+
     p = sub.add_parser("check", help="read-only credential checks (Telegram, Meta, Buffer/Pinterest secrets)")
     p.add_argument("--ping-telegram", action="store_true", help="also send a test message")
 
@@ -912,7 +928,7 @@ def main(argv: list[str] | None = None) -> int:
     use_clock_for_logs(app.settings.tz)
     try:
         return {"validate": cmd_validate, "plan": cmd_plan, "run": cmd_run, "sources": cmd_sources,
-                "prescreen": cmd_prescreen, "telegram-control": cmd_telegram_control, "check": cmd_check, "test-post": cmd_test_post, "meta-info": cmd_meta_info, "merge-state": cmd_merge_state, "status": cmd_status}[args.command](
+                "prescreen": cmd_prescreen, "telegram-control": cmd_telegram_control, "comments-report": cmd_comments_report, "check": cmd_check, "test-post": cmd_test_post, "meta-info": cmd_meta_info, "merge-state": cmd_merge_state, "status": cmd_status}[args.command](
             args, app)
     except (MissingSecret, GoogleError) as exc:
         print(str(exc), file=sys.stderr)
