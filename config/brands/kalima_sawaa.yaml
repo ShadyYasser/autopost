@@ -74,9 +74,9 @@ streams:
       # "cold open <file>: ..." lines in the prescreen log will be reviewed.
       hook: { enabled: false, min_seconds: 1.5, max_seconds: 6, skip_first_seconds: 8 }
       zoom: { enabled: true, factor: 1.07, min_shot_seconds: 4 }                          # light punch-in cuts
-      # A decorative clip blended over the picture at 10%: one file per reel, the next file each time.
+      # A decorative clip blended over the picture at 20%: one file per reel, the next file each time.
       # Put any clips you have the right to use in the folder; black-background effects work best with `screen`.
-      overlay: { enabled: true, dir: "assets/kalima_sawaa/overlays", opacity: 0.10, blend: screen }
+      overlay: { enabled: true, dir: "assets/kalima_sawaa/overlays", opacity: 0.20, blend: screen }
       # A brighter line that travels around the window and closes exactly as the reel ends.
       progress: { enabled: true, color: "#ffd98a", width: 9, glow: 6 }
       # The logo animation closes every reel; it is sped up to keep the post under 178s, and left out when

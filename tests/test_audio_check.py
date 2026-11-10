@@ -654,7 +654,7 @@ def test_the_real_config_turns_every_edit_on(app):
     e = app.brands["kalima_sawaa"].streams["short"].edits
     assert not e.hook.enabled                      # off: nobody reviews which sentence opens the reel
     assert e.zoom.enabled and e.overlay.enabled and e.progress.enabled
-    assert e.overlay.opacity == 0.10 and e.overlay.blend == "screen"
+    assert e.overlay.opacity == 0.20 and e.overlay.blend == "screen"
 
 
 # ------------------------------------------------------------------ the closing logo clip
