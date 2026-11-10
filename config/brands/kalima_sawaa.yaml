@@ -81,7 +81,7 @@ streams:
       outro: { enabled: true, path: "assets/kalima_sawaa/outro.mp4", max_total_seconds: 178, max_speed: 2.5 }
       # Slowly turning 10-fold Islamic rosettes in gold on the cream margins (scripts/make_pattern.py). Every
       # line runs at a multiple of 36 degrees, so no two lines are ever perpendicular: no cross can form.
-      pattern: { enabled: true, path: "assets/kalima_sawaa/pattern.mp4", color: "#a47a3c", opacity: 0.30 }
+      pattern: { enabled: true, path: "assets/kalima_sawaa/pattern.mp4", color: "#a47a3c", opacity: 0.50 }
     cover: random_frame        # cover/thumbnail = a random good frame (Instagram + TikTok/YouTube via Buffer)
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
   long:
