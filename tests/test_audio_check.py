@@ -652,7 +652,8 @@ def test_decoration_only_edits_need_no_transcript(app, tmp_path):
 
 def test_the_real_config_turns_every_edit_on(app):
     e = app.brands["kalima_sawaa"].streams["short"].edits
-    assert e.hook.enabled and e.zoom.enabled and e.overlay.enabled and e.progress.enabled
+    assert not e.hook.enabled                      # off: nobody reviews which sentence opens the reel
+    assert e.zoom.enabled and e.overlay.enabled and e.progress.enabled
     assert e.overlay.opacity == 0.10 and e.overlay.blend == "screen"
 
 

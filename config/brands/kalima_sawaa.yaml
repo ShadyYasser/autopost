@@ -69,7 +69,10 @@ streams:
     # picture). Times come from the Whisper transcript of the audio check; the cold open sentence is chosen by
     # the same language model, and a reel with no clearly suitable sentence simply gets none.
     edits:
-      hook: { enabled: true, min_seconds: 1.5, max_seconds: 6, skip_first_seconds: 8 }   # cold open
+      # Cold open: OFF. Moaz's reels cut between him and the other side, and the transcript does not say who
+      # is speaking, so a wrong pick would open the reel with the opponent's words. Turn on only if the
+      # "cold open <file>: ..." lines in the prescreen log will be reviewed.
+      hook: { enabled: false, min_seconds: 1.5, max_seconds: 6, skip_first_seconds: 8 }
       zoom: { enabled: true, factor: 1.07, min_shot_seconds: 4 }                          # light punch-in cuts
       # A decorative clip blended over the picture at 10%: one file per reel, the next file each time.
       # Put any clips you have the right to use in the folder; black-background effects work best with `screen`.
