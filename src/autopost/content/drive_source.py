@@ -26,8 +26,8 @@ from zoneinfo import ZoneInfo
 
 from ..config import AppConfig, FilenameTextSource, SheetTextSource, resolve_asset
 from ..cover import Cover, pick_cover
-from ..edits import (EditPlan, HookRules, OutroSpec, OverlaySpec, ProgressStyle, Segment, hook_candidates,
-                     hook_window, segments_from_json, segments_to_json, zoom_windows)
+from ..edits import (EditPlan, HookRules, OutroSpec, OverlaySpec, PatternSpec, ProgressStyle, Segment,
+                     hook_candidates, hook_window, segments_from_json, segments_to_json, zoom_windows)
 from ..frame import FrameStyle, render_video
 from ..media import EncodeSettings, MediaInfo, ProbeError, TranscodeError, from_drive, prepare_for_upload, probe
 from ..state import State
@@ -545,9 +545,12 @@ class DriveContent:
         if e.progress and e.progress.enabled:
             progress = ProgressStyle(color=e.progress.color, width=e.progress.width, glow=e.progress.glow)
         body = duration + (hook[1] - hook[0] if hook else 0.0)
+        pattern = None
+        if e.pattern and e.pattern.enabled and resolve_asset(e.pattern.path).is_file():
+            pattern = PatternSpec(resolve_asset(e.pattern.path), color=e.pattern.color, opacity=e.pattern.opacity)
         plan = EditPlan(hook=hook, zoom=zoom, zoom_factor=e.zoom.factor if e.zoom else 1.0,
                         overlay=self.overlay_for(brand, stream, video), progress=progress,
-                        outro=self.outro_for(brand, stream, body))
+                        outro=self.outro_for(brand, stream, body), pattern=pattern)
         return plan if plan else None
 
     def audio_verdict(self, brand: str, stream: str, video: VideoItem) -> AudioVerdict:

@@ -100,6 +100,41 @@ def _prepare_logo(logo, bg: str):
     return out.crop(box) if box else out
 
 
+def logo_box(style: FrameStyle) -> tuple[int, int, int, int] | None:
+    """(x0, y0, x1, y1) of the logo as render_layer places it, or None without a logo."""
+    from PIL import Image
+
+    if not (style.logo and Path(style.logo).exists()):
+        return None
+    logo = _prepare_logo(Image.open(style.logo), style.bg)
+    W = style.width
+    scale = min((style.top_bar - 50) / logo.height, (W - 2 * style.side_margin) / logo.width)
+    lw, lh = max(1, round(logo.width * scale)), max(1, round(logo.height * scale))
+    x0, y0 = (W - lw) // 2, (style.top_bar - lh) // 2
+    return x0, y0, x0 + lw, y0 + lh
+
+
+def render_pattern_mask(style: FrameStyle, rect: tuple[int, int, int, int]):
+    """Grey image that lets the geometric pattern show only on the plain cream: never on the video window
+    and its gold border, never behind the logo, never behind the credit line. Soft edges, so the pattern
+    fades out instead of being cut."""
+    from PIL import Image, ImageDraw, ImageFilter
+
+    W, H = style.width, style.height
+    x, y, w, h = rect
+    m = Image.new("L", (W, H), 255)
+    d = ImageDraw.Draw(m)
+    gap = style.border + 14
+    d.rounded_rectangle([x - gap, y - gap, x + w + gap, y + h + gap], radius=style.radius + gap, fill=0)
+    box = logo_box(style)
+    if box:
+        x0, y0, x1, y1 = box
+        d.rounded_rectangle([x0 - 40, y0 - 24, x1 + 40, y1 + 24], radius=40, fill=0)
+    if style.credit:
+        d.rectangle([W // 2 - 270, H - style.bottom_bar, W // 2 + 270, H], fill=0)
+    return m.filter(ImageFilter.GaussianBlur(10))
+
+
 def render_layer(style: FrameStyle, rect: tuple[int, int, int, int]):
     """RGBA image: opaque everywhere except the (rounded) video window, which is transparent."""
     from PIL import Image, ImageDraw, ImageFont
@@ -152,7 +187,8 @@ def input_order(plan: EditPlan) -> dict[str, int]:
     """Which ffmpeg input index each piece gets. The order here is the order `render_video` passes them in."""
     order = ["src"] + (["hook"] if plan.hook else [])
     order += ["overlay", "mask"] if plan.overlay else []
-    order += (["outro"] if plan.outro else []) + (["ring"] if plan.progress else []) + ["layer"]
+    order += (["outro"] if plan.outro else []) + (["pattern", "pmask"] if plan.pattern else [])
+    order += (["ring"] if plan.progress else []) + ["layer"]
     return {name: i for i, name in enumerate(order)}
 
 
@@ -253,7 +289,19 @@ def frame_filter(style: FrameStyle, rect: tuple[int, int, int, int], plan: EditP
 
     parts.append(f"color=c={style.bg.replace('#', '0x')}:s={style.width}x{style.height}:r={style.fps},"
                  f"format=yuv420p[bg];[bg][vid]overlay={x}:{y}:shortest=1[comp];"
-                 f"[comp][{idx['layer']}:v]overlay=0:0:format=auto:shortest=1[framed]")
+                 f"[comp][{idx['layer']}:v]overlay=0:0:format=auto:shortest=1[framed0]")
+
+    if plan.pattern is not None:
+        # white-on-black clip -> gold lines on the cream only (the mask keeps it off the window, logo, credit)
+        pt = plan.pattern
+        parts.append(f"[{idx['pattern']}:v]scale={style.width}:{style.height},fps={style.fps},format=gray[pg];"
+                     f"[{idx['pmask']}:v]scale={style.width}:{style.height},fps={style.fps},format=gray[pk];"
+                     f"[pg][pk]blend=all_mode=multiply:shortest=1,lut=c0=val*{pt.opacity:.3f}[pa];"
+                     f"color=c={pt.color.replace('#', '0x')}:s={style.width}x{style.height}:r={style.fps},"
+                     f"format=rgba[pc];[pc][pa]alphamerge[pat];"
+                     f"[framed0][pat]overlay=0:0:shortest=1[framed]")
+    else:
+        parts.append("[framed0]null[framed]")
 
     if ring is not None:
         rx, ry = ring.offset
@@ -299,6 +347,11 @@ def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_
         except ProbeError:
             outro_audio = False
         inputs += ["-i", str(plan.outro.path)]
+    pmask_path = work_dir / f"{src.stem}.pmask.png"
+    if plan.pattern is not None:
+        render_pattern_mask(style, rect).save(pmask_path)
+        inputs += ["-stream_loop", "-1", "-i", str(plan.pattern.path),
+                   "-framerate", str(style.fps), "-loop", "1", "-i", str(pmask_path)]
     if ring is not None:
         inputs += ["-framerate", str(ring.fps), "-i", str(ring.pattern)]
     inputs += ["-framerate", str(style.fps), "-loop", "1", "-i", str(layer_path)]
@@ -321,7 +374,7 @@ def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_
         f"; overlay {plan.overlay.path.name} at {plan.overlay.opacity:.0%}" if plan.overlay else "") + (
         "; progress ring" if ring else "") + (
         f"; outro {plan.outro.path.name} x{plan.outro.speed:.2f} ({plan.outro.seconds:.1f}s)"
-        if plan.outro else "")
+        if plan.outro else "") + ("; moving pattern" if plan.pattern else "")
     log.info("framing %s: window %dx%d at (%d,%d) in %dx%d%s", src.name, rect[2], rect[3], rect[0], rect[1],
              style.width, style.height, notes)
     try:
@@ -332,6 +385,7 @@ def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_
     finally:
         layer_path.unlink(missing_ok=True)
         mask_path.unlink(missing_ok=True)
+        pmask_path.unlink(missing_ok=True)
         shutil.rmtree(ring_dir, ignore_errors=True)
     if result.returncode != 0:
         out.unlink(missing_ok=True)

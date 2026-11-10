@@ -487,6 +487,15 @@ class ProgressConfig(_Model):
     glow: int = Field(6, ge=0, le=40)
 
 
+class PatternConfig(_Model):
+    """Animated Islamic geometric pattern in the cream margins around the video (made by
+    scripts/make_pattern.py: 10-fold rosettes whose lines are never perpendicular, so no cross can form)."""
+    enabled: bool = True
+    path: str = "assets/kalima_sawaa/pattern.mp4"
+    color: str = "#a47a3c"
+    opacity: float = Field(0.3, gt=0, le=1.0)
+
+
 class OutroConfig(_Model):
     """A closing clip played after the reel (a logo animation). It is sped up when the reel is long, and
     left out when even the fastest version would push the post past `max_total_seconds`."""
@@ -505,6 +514,7 @@ class EditsConfig(_Model):
     overlay: OverlayConfig | None = None
     progress: ProgressConfig | None = None
     outro: OutroConfig | None = None
+    pattern: PatternConfig | None = None
 
 
 class AudioCheckConfig(_Model):
@@ -717,6 +727,8 @@ def validate_brand(brand: BrandConfig, settings: Settings) -> list[str]:
                 errors.append(f"{sp}: edits.overlay folder not found: {e.overlay.dir}")
             if e.outro and e.outro.enabled and not resolve_asset(e.outro.path).is_file():
                 errors.append(f"{sp}: edits.outro file not found: {e.outro.path}")
+            if e.pattern and e.pattern.enabled and not resolve_asset(e.pattern.path).is_file():
+                errors.append(f"{sp}: edits.pattern file not found: {e.pattern.path}")
         for slot in stream.slots:
             if slot not in brand.slots:
                 errors.append(f"{sp}: unknown slot {slot!r} (defined: {sorted(brand.slots)})")

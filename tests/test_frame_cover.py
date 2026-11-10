@@ -361,3 +361,61 @@ def test_the_overlay_never_touches_the_middle_and_adds_no_colour_cast(tmp_path):
     corner = (rect[0] + 20, rect[1] + 20)
     before, after = area(plain, *corner), area(dark, *corner)
     assert np.abs(after - before).max() < 2                                    # no lift and no colour cast
+
+
+# ------------------------------------------------------------------ moving pattern in the cream margins
+
+from autopost.edits import PatternSpec  # noqa: E402
+from autopost.frame import logo_box, render_pattern_mask  # noqa: E402
+
+PATTERN = ROOT / "assets/kalima_sawaa/pattern.mp4"
+
+
+def test_the_pattern_mask_keeps_off_the_window_the_logo_and_the_credit():
+    import numpy as np
+
+    s = style()
+    rect = video_rect(s, 1080, 1920)
+    m = np.asarray(render_pattern_mask(s, rect), dtype=np.float32)
+    x, y, w, h = rect
+    assert m[y + h // 2, x + w // 2] == 0                              # the video window
+    assert m[y - s.border - 2, x + w // 2] < 30                         # its gold border
+    x0, y0, x1, y1 = logo_box(s)
+    assert m[(y0 + y1) // 2, (x0 + x1) // 2] == 0                       # the logo
+    assert m[1920 - 40, 540] == 0                                       # the credit line
+    assert m[y + h // 2, x // 2] > 200                                  # the side margin shows it
+    assert m[60, 40] > 200                                              # the top corner shows it
+
+
+def test_the_pattern_comes_after_the_frame_and_before_the_ring():
+    s, rect = style(), video_rect(style(), 720, 1280)
+    plan = EditPlan(pattern=PatternSpec(PATTERN, opacity=0.3), progress=ProgressStyle())
+    assert input_order(plan) == {"src": 0, "pattern": 1, "pmask": 2, "ring": 3, "layer": 4}
+    graph = frame_filter(s, rect, plan)
+    assert "lut=c0=val*0.300" in graph and "alphamerge[pat]" in graph
+    assert graph.index("[framed0][pat]overlay") < graph.index("[framed]format=yuv420p")
+
+
+@needs_ffmpeg
+def test_render_with_the_pattern_leaves_the_video_untouched(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    src = tmp_path / "flat.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0x404850:s=720x1280:d=3",
+                    "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", str(src)], check=True)
+    rect = video_rect(style(), 720, 1280)
+    shots = {}
+    for name, plan in (("plain", None), ("pat", EditPlan(pattern=PatternSpec(PATTERN, opacity=0.6)))):
+        out = render_video(src, tmp_path / f"{name}.mp4", style(preset="ultrafast", crf=12), probe(src),
+                           tmp_path, plan=plan)
+        shot = tmp_path / f"{name}.png"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", "1", "-i", str(out), "-frames:v", "1", str(shot)],
+                       check=True)
+        shots[name] = np.asarray(Image.open(shot).convert("L"), dtype=np.float32)
+    x, y, w, h = rect
+    inside = (slice(y + 20, y + h - 20), slice(x + 20, x + w - 20))
+    assert np.abs(shots["pat"][inside] - shots["plain"][inside]).max() < 3      # the reel is not touched
+    margin = (slice(y, y + h), slice(0, x - 20))
+    assert np.abs(shots["pat"][margin] - shots["plain"][margin]).max() > 20     # the margin has the pattern
+    assert not list(tmp_path.glob("*.pmask.png"))

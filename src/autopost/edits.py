@@ -100,6 +100,14 @@ class OutroSpec:
 
 
 @dataclass(frozen=True)
+class PatternSpec:
+    """The animated geometric pattern in the cream margins (white-on-black clip, coloured at render time)."""
+    path: Path
+    color: str = "#a47a3c"
+    opacity: float = 0.3
+
+
+@dataclass(frozen=True)
 class ProgressStyle:
     """The ring that closes around the video window as the reel ends."""
     color: str = "#ffd98a"
@@ -115,10 +123,11 @@ class EditPlan:
     overlay: OverlaySpec | None = None
     progress: ProgressStyle | None = None
     outro: OutroSpec | None = None
+    pattern: PatternSpec | None = None
 
     def __bool__(self) -> bool:
         return (self.hook is not None or bool(self.zoom) or self.overlay is not None
-                or self.progress is not None or self.outro is not None)
+                or self.progress is not None or self.outro is not None or self.pattern is not None)
 
     @property
     def hook_seconds(self) -> float:
