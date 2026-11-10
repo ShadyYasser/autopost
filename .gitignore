@@ -22,6 +22,8 @@ work/
 *.mov
 *.mkv
 *.webm
+# the decorative overlay clips are part of the repo, not scratch
+!assets/**/*.mp4
 state/*.db-journal
 state/*.db-wal
 state/*.db-shm

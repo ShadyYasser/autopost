@@ -444,6 +444,79 @@ class FrameConfig(_Model):
     crf: int = Field(18, ge=0, le=51)
 
 
+class HookConfig(_Model):
+    """Cold open: one complete sentence of the speaker, from later in the reel, plays before the reel."""
+    enabled: bool = True
+    min_seconds: float = Field(1.5, ge=0.5, le=10)
+    max_seconds: float = Field(6.0, ge=1, le=15)
+    skip_first_seconds: float = Field(8.0, ge=0, le=120)
+    max_total_seconds: float = Field(178.0, ge=10)    # no cold open when it would push the reel past this length
+
+    @model_validator(mode="after")
+    def _range(self) -> "HookConfig":
+        if self.max_seconds < self.min_seconds:
+            raise ValueError("hook.max_seconds is below hook.min_seconds")
+        return self
+
+
+class ZoomConfig(_Model):
+    """Zoom cuts: the picture alternates between normal and a light punch-in where a new sentence starts."""
+    enabled: bool = True
+    factor: float = Field(1.07, gt=1.0, le=1.3)
+    min_shot_seconds: float = Field(4.0, ge=1, le=60)
+
+
+class OverlayConfig(_Model):
+    """A decorative clip blended over the picture at a low opacity; a different file per reel.
+
+    The files live in `dir` (any video ffmpeg reads). They are meant to be effects on a black background -
+    light leaks, sparks, a glowing border - because `screen` leaves black pixels untouched."""
+    enabled: bool = True
+    dir: str = "assets/kalima_sawaa/overlays"
+    opacity: float = Field(0.1, gt=0, le=0.6)
+    blend: Literal["screen", "lighten", "addition", "softlight", "overlay"] = "screen"
+    # the middle of the picture, where the speaker is, is kept completely free of the effect
+    protect_center: float = Field(0.45, ge=0.0, le=0.9)
+
+
+class ProgressConfig(_Model):
+    """A brighter line that travels around the video window and closes as the reel ends."""
+    enabled: bool = True
+    color: str = "#ffd98a"
+    width: int = Field(9, ge=2, le=40)
+    glow: int = Field(6, ge=0, le=40)
+
+
+class PatternConfig(_Model):
+    """Animated Islamic geometric pattern in the cream margins around the video (made by
+    scripts/make_pattern.py: 10-fold rosettes whose lines are never perpendicular, so no cross can form)."""
+    enabled: bool = True
+    path: str = "assets/kalima_sawaa/pattern.mp4"
+    color: str = "#a47a3c"
+    opacity: float = Field(0.3, gt=0, le=1.0)
+
+
+class OutroConfig(_Model):
+    """A closing clip played after the reel (a logo animation). It is sped up when the reel is long, and
+    left out when even the fastest version would push the post past `max_total_seconds`."""
+    enabled: bool = True
+    path: str = "assets/kalima_sawaa/outro.mp4"
+    max_total_seconds: float = Field(178.0, ge=10)
+    max_speed: float = Field(2.5, ge=1.0, le=4.0)
+
+
+class EditsConfig(_Model):
+    """Edits applied while the video is framed; no text is ever added to the picture. All of them need
+    `frame`. `hook` and `zoom` are cut from the reel itself and additionally need the audio check on the
+    stream, because their timestamps come from the Whisper transcript."""
+    hook: HookConfig | None = None
+    zoom: ZoomConfig | None = None
+    overlay: OverlayConfig | None = None
+    progress: ProgressConfig | None = None
+    outro: OutroConfig | None = None
+    pattern: PatternConfig | None = None
+
+
 class AudioCheckConfig(_Model):
     """Judge what is said in a reel too: Whisper transcribes the first seconds, the same model judges the text."""
     enabled: bool = True
@@ -506,6 +579,7 @@ class StreamConfig(_Model):
     backfill: BackfillConfig | None = None
     media: StreamMediaConfig = Field(default_factory=StreamMediaConfig)
     frame: FrameConfig | None = None
+    edits: EditsConfig | None = None
     # random_frame: cover/thumbnail = a random good frame of the video (Instagram, and TikTok/YouTube via Buffer)
     cover: Literal["none", "random_frame"] = "none"
 
@@ -641,6 +715,20 @@ def validate_brand(brand: BrandConfig, settings: Settings) -> list[str]:
             for label, asset in (("logo", stream.frame.logo), ("font", stream.frame.font)):
                 if not resolve_asset(asset).exists():
                     errors.append(f"{sp}: frame {label} file not found: {asset}")
+        if stream.edits:
+            e = stream.edits
+            if not stream.frame:
+                errors.append(f"{sp}: `edits` needs `frame` (the edits are made while the video is framed)")
+            if (e.hook or e.zoom) and not (brand.title_guard and brand.title_guard.enabled
+                                           and brand.title_guard.audio_for(name)):
+                errors.append(f"{sp}: edits.hook/zoom need title_guard.audio on this stream "
+                              f"(their times come from the transcript)")
+            if e.overlay and e.overlay.enabled and not resolve_asset(e.overlay.dir).is_dir():
+                errors.append(f"{sp}: edits.overlay folder not found: {e.overlay.dir}")
+            if e.outro and e.outro.enabled and not resolve_asset(e.outro.path).is_file():
+                errors.append(f"{sp}: edits.outro file not found: {e.outro.path}")
+            if e.pattern and e.pattern.enabled and not resolve_asset(e.pattern.path).is_file():
+                errors.append(f"{sp}: edits.pattern file not found: {e.pattern.path}")
         for slot in stream.slots:
             if slot not in brand.slots:
                 errors.append(f"{sp}: unknown slot {slot!r} (defined: {sorted(brand.slots)})")

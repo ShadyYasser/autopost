@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import mldeps
+from .edits import Segment
 from .media import ensure_ffmpeg
 
 log = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ class WhisperSettings:
     max_seconds: int = 180            # only the first N seconds are transcribed
     beam_size: int = 1                # greedy: several times faster, enough to judge what is said
     timeout_seconds: int = 30 * 60    # ffmpeg + decoding budget for one video
+    word_timestamps: bool = False     # exact word times (for the cold open / zoom cuts); a little slower
 
 
 def extract_audio(src: Path, out: Path, seconds: int, timeout: int = 300) -> Path:
@@ -90,6 +92,10 @@ class Transcriber:
 
     def transcribe(self, video: Path, work_dir: Path) -> str:
         """The spoken text of the first `max_seconds` of `video` ('' when nothing is said)."""
+        return self.transcribe_segments(video, work_dir)[0]
+
+    def transcribe_segments(self, video: Path, work_dir: Path) -> tuple[str, list[Segment]]:
+        """(spoken text, its segments with their times in the video) of the first `max_seconds`."""
         s = self.settings
         work_dir.mkdir(parents=True, exist_ok=True)
         wav = work_dir / f"{video.stem}.audio.wav"
@@ -98,16 +104,26 @@ class Transcriber:
             if self._model is None:
                 self._model = self._factory(s)
             try:
+                extra = {"word_timestamps": True} if s.word_timestamps else {}
                 segments, _info = self._model.transcribe(
                     read_wav(wav), language=s.language, beam_size=s.beam_size, vad_filter=True,
-                    condition_on_previous_text=False)
-                text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+                    condition_on_previous_text=False, **extra)
+                timed = [_segment(seg) for seg in segments if seg.text.strip()]
             except TranscribeError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 raise TranscribeError(f"Whisper failed on {video.name}: {type(exc).__name__}: {exc}") from exc
         finally:
             wav.unlink(missing_ok=True)
-        text = " ".join(text.split())
-        log.info("transcript of %s: %d characters", video.name, len(text))
-        return text
+        text = " ".join(" ".join(seg.text for seg in timed).split())
+        log.info("transcript of %s: %d characters, %d segments", video.name, len(text), len(timed))
+        return text, [seg for seg in timed if seg.end > seg.start]
+
+
+def _segment(seg) -> Segment:
+    """A Whisper segment as (start, end, text); with word times, from its first word to its last."""
+    start, end = float(getattr(seg, "start", 0.0) or 0.0), float(getattr(seg, "end", 0.0) or 0.0)
+    words = getattr(seg, "words", None) or []
+    if words:
+        start, end = float(words[0].start), float(words[-1].end)
+    return Segment(start, end, " ".join(seg.text.split()))

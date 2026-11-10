@@ -480,3 +480,231 @@ def test_merge_keeps_theirs_for_other_keys_when_a_prefix_is_given(tmp_path):
 
     merge_states(tmp_path / "theirs.db", tmp_path / "ours.db", tmp_path / "out2.db")
     assert State(tmp_path / "out2.db").kv_get("daily-summary") == "2026-11-06"    # the old rule: ours wins
+
+
+# ------------------------------------------------------------------ edits: cold open + zoom cuts
+
+from autopost.config import EditsConfig, HookConfig, ZoomConfig  # noqa: E402
+from autopost.edits import Segment  # noqa: E402
+
+TIMED = [Segment(0.0, 4.0, "مقدمة عن موضوع الحلقة النهارده"), Segment(10.0, 13.0, "هل النص ده بيقول كده فعلا"),
+         Segment(15.0, 19.0, "في ناس بتقول إن المعنى مختلف"), Segment(21.0, 24.0, "والرد موجود في نفس الإصحاح")]
+
+
+class TimedTranscriber(FakeTranscriber):
+    def transcribe_segments(self, video, work_dir):
+        return self.transcribe(video, work_dir), list(TIMED)
+
+
+class HookBackend(Scripted):
+    def __init__(self, pick=1, **kw):
+        super().__init__(**kw)
+        self.pick = pick
+
+    def complete(self, system, user, max_tokens=500):
+        data = json.loads(user)
+        if "candidates" in data:
+            self.calls.append(("hook", [c["text"] for c in data["candidates"]]))
+            if self.pick == "fail":
+                raise BackendError("model down", retryable=False)
+            return json.dumps({"n": self.pick, "reason": "own question"})
+        return super().complete(system, user, max_tokens)
+
+
+def edits_setup(app, tmp_path, pick=1, transcriber=None):
+    content, state, client, _, _, alerts = setup(app, tmp_path, n=1)
+    app.brands["kalima_sawaa"].streams["short"].edits = EditsConfig(hook=HookConfig(), zoom=ZoomConfig())
+    backend = HookBackend(pick=pick)
+    content._guard_backend, content._guards = backend, {}
+    content._transcriber = transcriber or TimedTranscriber()
+    return content, state, backend, content._transcriber, alerts
+
+
+def test_cold_open_is_chosen_once_among_timed_candidates(app, tmp_path):
+    content, state, backend, transcriber, alerts = edits_setup(app, tmp_path, pick=1)
+    video = content.next_video("kalima_sawaa", "short")
+    hooks = [c for c in backend.calls if c[0] == "hook"]
+    assert hooks == [("hook", [TIMED[1].text, TIMED[2].text, TIMED[3].text])]       # the opening segment is not offered
+    assert transcriber.calls == ["m1"] and not alerts
+    content._stream_of[video.id] = ("kalima_sawaa", "short")
+    plan = content.edit_plan(video, 30.0)
+    assert plan.hook == pytest.approx((9.92, 13.15)) and plan.zoom == [(10.0, 15.0), (21.0, 24.0)]
+    assert content.checked("kalima_sawaa", "short", video)
+    content.next_video("kalima_sawaa", "short")
+    assert len([c for c in backend.calls if c[0] == "hook"]) == 1 and transcriber.calls == ["m1"]    # cached
+
+
+def test_no_cold_open_when_the_model_answers_zero_but_zoom_stays(app, tmp_path):
+    content, _, backend, _, _ = edits_setup(app, tmp_path, pick=0)
+    video = content.next_video("kalima_sawaa", "short")
+    plan = content.edit_plan(video, 30.0)
+    assert plan.hook is None and plan.zoom
+    content.next_video("kalima_sawaa", "short")
+    assert len([c for c in backend.calls if c[0] == "hook"]) == 1                   # "none" is cached too
+
+
+def test_model_failure_on_the_cold_open_never_blocks_the_video(app, tmp_path):
+    content, _, backend, _, alerts = edits_setup(app, tmp_path, pick="fail")
+    video = content.next_video("kalima_sawaa", "short")
+    assert video.id == "m1" and not alerts
+    assert content.edit_plan(video, 30.0).hook is None
+    assert not content.checked("kalima_sawaa", "short", video)                      # asked again next time
+
+
+def test_cold_open_is_dropped_when_the_reel_would_get_too_long(app, tmp_path):
+    content, _, _, _, _ = edits_setup(app, tmp_path, pick=1)
+    video = content.next_video("kalima_sawaa", "short")
+    assert content.edit_plan(video, 177.0).hook is None
+
+
+def test_video_transcribed_before_the_edits_gets_its_times_on_the_next_check(app, tmp_path):
+    content, state, backend, transcriber, _ = edits_setup(app, tmp_path)
+    video = content.unused("kalima_sawaa", "short")[0]
+    state.kv_set(content._text_key("kalima_sawaa", video), "النص القديم المحفوظ")     # old state: text, no times
+    content.next_video("kalima_sawaa", "short")
+    assert transcriber.calls == ["m1"]                                              # transcribed once more
+    assert state.kv_get(content._text_key("kalima_sawaa", video)) == "النص القديم المحفوظ"   # judged text is kept
+    assert content.cached_segments("kalima_sawaa", video) == TIMED
+    assert content.checked("kalima_sawaa", "short", video)
+
+
+def test_edits_need_frame_and_audio_check(app):
+    from autopost.config import validate_brand
+    brand = app.brands["kalima_sawaa"]
+    assert not [e for e in validate_brand(brand, app.settings) if "edits" in e]
+    brand.streams["short"].frame = None
+    assert any("`edits` needs `frame`" in e for e in validate_brand(brand, app.settings))
+
+
+def test_pick_hook_rejects_out_of_range_and_garbage():
+    class One:
+        def __init__(self, reply): self.reply = reply
+        def complete(self, system, user, max_tokens=500): return self.reply
+    assert TitleGuard(backend=One('{"n": 2}')).pick_hook("t", "x", ["a", "b"]) == 1
+    assert TitleGuard(backend=One('{"n": 5}')).pick_hook("t", "x", ["a", "b"]) is None
+    assert TitleGuard(backend=One('{"n": "none"}')).pick_hook("t", "x", ["a", "b"]) is None
+    assert TitleGuard(backend=One('{"risk": "low"}')).pick_hook("t", "x", ["a", "b"]) is None
+    assert TitleGuard(backend=One("{}")).pick_hook("t", "x", []) is None
+
+
+# ------------------------------------------------------------------ overlay clip + progress ring
+
+from autopost.config import OverlayConfig, ProgressConfig  # noqa: E402
+
+OVERLAY_DIR = "assets/kalima_sawaa/overlays"
+
+
+def deco_setup(app, tmp_path, n=4, **kw):
+    content, state, client, backend, _, alerts = setup(app, tmp_path, n=n)
+    app.brands["kalima_sawaa"].streams["short"].edits = EditsConfig(
+        overlay=OverlayConfig(dir=OVERLAY_DIR, opacity=0.12), progress=ProgressConfig(), **kw)
+    return content, state, client, alerts
+
+
+def test_neighbouring_reels_get_different_overlay_clips(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    files = content.overlay_files("kalima_sawaa", "short")
+    assert len(files) >= 3 and all(f.exists() for f in files)
+    picks = []
+    for v in client.files[SHORT]:
+        content._stream_of[v.id] = ("kalima_sawaa", "short")
+        spec = content.overlay_for("kalima_sawaa", "short", v)
+        assert spec.opacity == 0.12 and spec.blend == "screen"
+        picks.append(spec.path)
+    assert all(a != b for a, b in zip(picks, picks[1:]))                    # consecutive msg_ids, different clips
+    assert len(set(picks)) == len(files)                                    # every clip is used in turn
+
+
+def test_the_same_reel_always_gets_the_same_clip(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    v = client.files[SHORT][0]
+    content._stream_of[v.id] = ("kalima_sawaa", "short")
+    first = content.overlay_for("kalima_sawaa", "short", v).path
+    assert content.overlay_for("kalima_sawaa", "short", v).path == first
+
+
+def test_an_empty_or_missing_overlay_folder_simply_means_no_overlay(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    app.brands["kalima_sawaa"].streams["short"].edits.overlay = OverlayConfig(dir=str(tmp_path / "none"))
+    v = client.files[SHORT][0]
+    content._stream_of[v.id] = ("kalima_sawaa", "short")
+    assert content.overlay_for("kalima_sawaa", "short", v) is None
+    assert content.edit_plan(v, 30.0).progress is not None                  # the ring still applies
+
+
+def test_overlay_and_ring_work_without_the_audio_check(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    app.brands["kalima_sawaa"].title_guard.audio = None
+    v = client.files[SHORT][0]
+    content._stream_of[v.id] = ("kalima_sawaa", "short")
+    assert not content.cuts_wanted("kalima_sawaa", "short")
+    plan = content.edit_plan(v, 30.0)
+    assert plan.overlay is not None and plan.progress is not None and plan.hook is None and plan.zoom == []
+    assert content.edits_planned("kalima_sawaa", "short", v)                # nothing to prepare, nothing cached
+
+
+def test_decoration_only_edits_need_no_transcript(app, tmp_path):
+    content, _, client, _ = deco_setup(app, tmp_path)
+    before = list(content._transcriber.calls) if content._transcriber else []
+    content.plan_edits("kalima_sawaa", "short", client.files[SHORT][0])
+    assert (content._transcriber.calls if content._transcriber else []) == before
+
+
+def test_the_real_config_turns_every_edit_on(app):
+    e = app.brands["kalima_sawaa"].streams["short"].edits
+    assert e.hook.enabled and e.zoom.enabled and e.overlay.enabled and e.progress.enabled
+    assert e.overlay.opacity == 0.10 and e.overlay.blend == "screen"
+
+
+# ------------------------------------------------------------------ the closing logo clip
+
+from autopost.config import OutroConfig  # noqa: E402
+
+
+def outro_setup(app, tmp_path, **kw):
+    content, state, client, alerts = deco_setup(app, tmp_path, outro=OutroConfig(**kw))
+    v = client.files[SHORT][0]
+    content._stream_of[v.id] = ("kalima_sawaa", "short")
+    return content, v
+
+
+def test_a_short_reel_gets_the_outro_at_normal_speed(app, tmp_path):
+    content, v = outro_setup(app, tmp_path)
+    plan = content.edit_plan(v, 40.0)
+    assert plan.outro is not None and plan.outro.speed == 1.0
+    assert plan.outro.path.name == "outro.mp4" and plan.outro.seconds == pytest.approx(10, abs=0.5)
+
+
+def test_a_long_reel_speeds_the_outro_up_to_stay_under_the_limit(app, tmp_path):
+    content, v = outro_setup(app, tmp_path, max_total_seconds=100.0, max_speed=2.5)
+    plan = content.edit_plan(v, 95.0)                              # 5s left for a 10s clip
+    assert plan.outro.speed == pytest.approx(2.0, abs=0.05)
+    assert 95.0 + plan.outro.seconds <= 100.0
+
+
+def test_the_outro_is_left_out_when_even_the_fastest_version_would_not_fit(app, tmp_path):
+    content, v = outro_setup(app, tmp_path, max_total_seconds=100.0, max_speed=2.5)
+    assert content.edit_plan(v, 97.0).outro is None                # would need x3.3
+    assert content.edit_plan(v, 100.0).outro is None               # nothing left at all
+
+
+def test_the_cold_open_counts_towards_the_outro_budget(app, tmp_path):
+    content, v = outro_setup(app, tmp_path, max_total_seconds=60.0, max_speed=4.0)
+    without = content.edit_plan(v, 50.0).outro.speed
+    content.state.kv_set(content._hook_key("kalima_sawaa", v),
+                         json.dumps({"start": 20.0, "end": 25.0, "text": "جملة"}))
+    app.brands["kalima_sawaa"].streams["short"].edits.hook = HookConfig()
+    with_hook = content.edit_plan(v, 50.0)
+    assert with_hook.hook is not None and with_hook.outro.speed > without
+    assert 50.0 + with_hook.hook_seconds + with_hook.outro_seconds <= 60.0
+
+
+def test_a_missing_outro_file_is_logged_once_and_never_blocks_a_post(app, tmp_path):
+    content, v = outro_setup(app, tmp_path, path=str(tmp_path / "gone.mp4"))
+    assert content.edit_plan(v, 30.0).outro is None
+    assert content.edit_plan(v, 30.0).outro is None                # the failed probe is remembered
+
+
+def test_the_real_config_closes_every_reel_with_the_logo(app):
+    e = app.brands["kalima_sawaa"].streams["short"].edits
+    assert e.outro.enabled and e.outro.max_total_seconds == 178 and e.overlay.protect_center == 0.45

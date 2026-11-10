@@ -15,6 +15,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from zoneinfo import ZoneInfo
 
 from ..config import AppConfig, FilenameTextSource, SheetTextSource, resolve_asset
 from ..cover import Cover, pick_cover
+from ..edits import (EditPlan, HookRules, OutroSpec, OverlaySpec, PatternSpec, ProgressStyle, Segment,
+                     hook_candidates, hook_window, segments_from_json, segments_to_json, zoom_windows)
 from ..frame import FrameStyle, render_video
 from ..media import EncodeSettings, MediaInfo, ProbeError, TranscodeError, from_drive, prepare_for_upload, probe
 from ..state import State
@@ -38,6 +41,7 @@ from ..transcribe import TranscribeError, Transcriber, WhisperSettings
 
 log = logging.getLogger(__name__)
 
+VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 POSTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
 _PARSE_FORMATS = (POSTED_AT_FORMAT, "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y")
 
@@ -184,6 +188,8 @@ class DriveContent:
         self._local_backends: dict[tuple[str, str, int], LocalBackend] = {}
         self._transcribers: dict[str, Transcriber] = {}
         self._covers: dict[str, Cover] = {}
+        self._overlays: dict[Path, list[Path]] = {}
+        self._outros: dict[Path, float | None] = {}
         self.state = state
         self.client = client
         self.work_dir = work_dir
@@ -335,8 +341,10 @@ class DriveContent:
             return self._transcriber
         if brand not in self._transcribers:
             a = self.app.brands[brand].title_guard.audio
-            self._transcribers[brand] = Transcriber(WhisperSettings(model=a.whisper_model, compute_type=a.compute_type,
-                                                                    language=a.language, max_seconds=a.max_seconds))
+            timed = any(st.edits for st in self.app.brands[brand].streams.values())
+            self._transcribers[brand] = Transcriber(WhisperSettings(
+                model=a.whisper_model, compute_type=a.compute_type, language=a.language, max_seconds=a.max_seconds,
+                word_timestamps=timed))
         return self._transcribers[brand]
 
     def cached_audio(self, brand: str, video: VideoItem) -> AudioVerdict | None:
@@ -348,26 +356,202 @@ class DriveContent:
         except (ValueError, KeyError):
             return None
 
-    def transcript(self, brand: str, video: VideoItem) -> str:
-        """What is said in the first seconds of the video (cached in state, so a failed later step never costs
-        a second transcription). Downloads the original, transcribes it, deletes the download."""
-        key = self._text_key(brand, video)
-        cached = self.state.kv_get(key)
-        if cached is not None:
-            return cached
+    def _segs_key(self, brand: str, video: VideoItem) -> str:
+        return self._guard_key(brand, video)[0].replace("guard:", "audio:segs:", 1)
+
+    def _hook_key(self, brand: str, video: VideoItem) -> str:
+        return self._guard_key(brand, video)[0].replace("guard:", "guard:hook:", 1)
+
+    def _transcribe(self, brand: str, video: VideoItem) -> tuple[str, list[Segment]]:
+        """Download the original, transcribe it, delete the download; the text and its timed segments go to state."""
         suffix = Path(video.name).suffix.lower() or ".mp4"
         dest = self.work_dir / f"{video.id}.screen{suffix}"
+        transcriber = self.transcriber_for(brand)
         try:
             log.info("audio check: downloading %s (%s)", video.name, _size(video.size))
             self.client.download(video.id, dest, video.size)
-            text = self.transcriber_for(brand).transcribe(dest, self.work_dir)
+            timed = getattr(transcriber, "transcribe_segments", None)
+            text, segments = timed(dest, self.work_dir) if timed else (transcriber.transcribe(dest, self.work_dir), [])
         except (GoogleError, TranscribeError) as exc:
             raise ContentError(f"{video.name}: audio check failed: {exc}") from exc
         finally:
             dest.unlink(missing_ok=True)
         text = " ".join(text.split())[:MAX_TRANSCRIPT]
-        self.state.kv_set(key, text)
-        return text
+        if self.state.kv_get(self._text_key(brand, video)) is None:      # the judged text never changes afterwards
+            self.state.kv_set(self._text_key(brand, video), text)
+        self.state.kv_set(self._segs_key(brand, video), segments_to_json(segments))
+        return text, segments
+
+    def transcript(self, brand: str, video: VideoItem) -> str:
+        """What is said in the first seconds of the video (cached in state, so a failed later step never costs
+        a second transcription)."""
+        cached = self.state.kv_get(self._text_key(brand, video))
+        if cached is not None:
+            return cached
+        return self._transcribe(brand, video)[0]
+
+    def cached_segments(self, brand: str, video: VideoItem) -> list[Segment] | None:
+        raw = self.state.kv_get(self._segs_key(brand, video))
+        if raw is None:
+            return None
+        try:
+            return segments_from_json(raw)
+        except (ValueError, TypeError):
+            return None
+
+    def segments(self, brand: str, video: VideoItem) -> list[Segment]:
+        """The transcript's segments with their times (cached). A video transcribed before the edits were turned
+        on has only its text in state, so it is transcribed once more."""
+        cached = self.cached_segments(brand, video)
+        return cached if cached is not None else self._transcribe(brand, video)[1]
+
+    # ------------------------------------------------------------ edits (cold open, zoom cuts)
+
+    def edits_for(self, brand: str, stream: str):
+        """The stream's edits config, or None when it has none (they all need the frame)."""
+        cfg = self.app.brands[brand].streams[stream]
+        return cfg.edits if (cfg.edits and cfg.frame) else None
+
+    def cuts_wanted(self, brand: str, stream: str) -> bool:
+        """True when a cold open or zoom cuts are on: those are the edits that need the transcript's times."""
+        e = self.edits_for(brand, stream)
+        if e is None or not self.audio_on(brand, stream):
+            return False
+        return bool((e.hook and e.hook.enabled) or (e.zoom and e.zoom.enabled))
+
+    def hook_wanted(self, brand: str, stream: str) -> HookRules | None:
+        e = self.edits_for(brand, stream)
+        if e is None or e.hook is None or not e.hook.enabled or not self.audio_on(brand, stream):
+            return None
+        return HookRules(min_seconds=e.hook.min_seconds, max_seconds=e.hook.max_seconds,
+                         skip_first_seconds=e.hook.skip_first_seconds)
+
+    def cached_hook(self, brand: str, video: VideoItem) -> Segment | None | bool:
+        """The chosen opening sentence; None = decided that there is none; False = not decided yet."""
+        raw = self.state.kv_get(self._hook_key(brand, video))
+        if raw is None:
+            return False
+        try:
+            data = json.loads(raw)
+            return Segment(float(data["start"]), float(data["end"]), str(data["text"])) if data else None
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def overlay_files(self, brand: str, stream: str) -> list[Path]:
+        """The decorative clips of this stream, in a stable order ([] when the feature is off or the folder
+        is empty, which simply means no overlay)."""
+        e = self.edits_for(brand, stream)
+        if e is None or e.overlay is None or not e.overlay.enabled:
+            return []
+        folder = resolve_asset(e.overlay.dir)
+        if folder not in self._overlays:
+            files = sorted(f for f in folder.glob("*") if f.suffix.lower() in VIDEO_SUFFIXES) if folder.is_dir() else []
+            self._overlays[folder] = files
+            if not files:
+                log.warning("no overlay clips in %s; reels are framed without one", folder)
+        return self._overlays[folder]
+
+    def overlay_for(self, brand: str, stream: str, video: VideoItem) -> OverlaySpec | None:
+        """One clip per reel, the next one each time: Telegram message ids count up reel by reel, so
+        neighbouring reels never get the same clip. Files without one fall back to their Drive id."""
+        files = self.overlay_files(brand, stream)
+        if not files:
+            return None
+        e = self.edits_for(brand, stream).overlay
+        n = video.tg_msg_id if video.tg_msg_id is not None else int(hashlib.sha1(video.id.encode()).hexdigest()[:8], 16)
+        return OverlaySpec(files[n % len(files)], opacity=e.opacity, blend=e.blend,
+                           protect_center=e.protect_center)
+
+    def outro_for(self, brand: str, stream: str, body_seconds: float) -> OutroSpec | None:
+        """The closing clip, sped up by as much as it takes to stay under the length limit. None when the
+        reel is already so long that even the fastest version would not fit, or the file cannot be read."""
+        e = self.edits_for(brand, stream)
+        if e is None or e.outro is None or not e.outro.enabled:
+            return None
+        path = resolve_asset(e.outro.path)
+        if path not in self._outros:
+            try:
+                self._outros[path] = probe(path).duration_s
+            except ProbeError as exc:
+                log.warning("outro %s unusable, reels go out without it: %s", path, exc)
+                self._outros[path] = None
+        duration = self._outros[path]
+        if not duration:
+            return None
+        available = e.outro.max_total_seconds - body_seconds
+        if available <= 0.5:
+            return None
+        speed = max(1.0, duration / available)
+        if speed > e.outro.max_speed:
+            log.info("no outro on this reel: it would need x%.2f to fit", speed)
+            return None
+        return OutroSpec(path, duration, math.ceil(speed * 1000) / 1000)   # round up: never over the limit
+
+    def plan_edits(self, brand: str, stream: str, video: VideoItem) -> None:
+        """Prepare what `fetch` needs for the cuts: the timed segments and the model's choice of an opening
+        sentence, both cached. Cosmetic: any failure is logged and the reel goes out without the edit."""
+        if not self.cuts_wanted(brand, stream):
+            return
+        try:
+            segments = self.segments(brand, video)
+        except ContentError as exc:
+            log.warning("edits for %s skipped: %s", video.name, exc)
+            return
+        rules = self.hook_wanted(brand, stream)
+        if rules is None or self.cached_hook(brand, video) is not False:
+            return
+        candidates = hook_candidates(segments, rules)
+        chosen: Segment | None = None
+        if candidates:
+            title = self._guard_key(brand, video)[1]
+            try:
+                index = self.guard_for(brand).pick_hook(title, self.transcript(brand, video),
+                                                        [c.text for c in candidates])
+            except GuardError as exc:
+                log.warning("cold open for %s skipped: %s", video.name, exc)
+                return                                   # not cached: the next run asks again
+            chosen = candidates[index] if index is not None else None
+        self.state.kv_set(self._hook_key(brand, video), json.dumps(
+            {"start": chosen.start, "end": chosen.end, "text": chosen.text} if chosen else {}, ensure_ascii=False))
+        log.info("cold open %s: %s", video.name,
+                 f"{chosen.start:.1f}-{chosen.end:.1f}s «{chosen.text}»" if chosen else "none")
+
+    def edits_planned(self, brand: str, stream: str, video: VideoItem) -> bool:
+        if not self.cuts_wanted(brand, stream):
+            return True
+        if self.cached_segments(brand, video) is None:
+            return False
+        return self.hook_wanted(brand, stream) is None or self.cached_hook(brand, video) is not False
+
+    def edit_plan(self, video: VideoItem, duration: float) -> EditPlan | None:
+        """The edits of this video from what is cached in state (never calls a model, never transcribes)."""
+        where = self._stream_of.get(video.id)
+        e = self.edits_for(*where) if where else None
+        if e is None:
+            return None
+        brand, stream = where
+        hook, zoom = None, []
+        if self.cuts_wanted(brand, stream):
+            segments = [s for s in (self.cached_segments(brand, video) or []) if s.start < duration]
+            rules = self.hook_wanted(brand, stream)
+            chosen = self.cached_hook(brand, video) if rules else None
+            if chosen:
+                start, end = hook_window(chosen, rules, duration)
+                if end - start >= rules.min_seconds and duration + (end - start) <= e.hook.max_total_seconds:
+                    hook = (start, end)
+            if e.zoom and e.zoom.enabled:
+                zoom = zoom_windows(segments, duration, e.zoom.min_shot_seconds)
+        progress = None
+        if e.progress and e.progress.enabled:
+            progress = ProgressStyle(color=e.progress.color, width=e.progress.width, glow=e.progress.glow)
+        body = duration + (hook[1] - hook[0] if hook else 0.0)
+        pattern = None
+        if e.pattern and e.pattern.enabled and resolve_asset(e.pattern.path).is_file():
+            pattern = PatternSpec(resolve_asset(e.pattern.path), color=e.pattern.color, opacity=e.pattern.opacity)
+        plan = EditPlan(hook=hook, zoom=zoom, zoom_factor=e.zoom.factor if e.zoom else 1.0,
+                        overlay=self.overlay_for(brand, stream, video), progress=progress,
+                        outro=self.outro_for(brand, stream, body), pattern=pattern)
+        return plan if plan else None
 
     def audio_verdict(self, brand: str, stream: str, video: VideoItem) -> AudioVerdict:
         """What is said in the video, judged (cached in state). Any failure raises ContentError: nothing is
@@ -461,6 +645,7 @@ class DriveContent:
             if new.risk in cfg.block_levels:
                 return ("title", new.risk, verdict.original, new.reasons or verdict.reasons)
         self.topical_tags(brand, stream, video)
+        self.plan_edits(brand, stream, video)
         return None
 
     def checked(self, brand: str, stream: str, video: VideoItem) -> bool:
@@ -479,7 +664,9 @@ class DriveContent:
             return False
         if blocked and self.cached_retitle(brand, video) is None:
             return False
-        return not self.tags_wanted(brand, stream) or self.cached_tags(brand, video) is not None
+        if self.tags_wanted(brand, stream) and self.cached_tags(brand, video) is None:
+            return False
+        return self.edits_planned(brand, stream, video)
 
     def _alert_hold(self, brand: str, stream: str, video: VideoItem, what: str, risk: str, shown: str,
                     reasons: tuple[str, ...]) -> None:
@@ -611,12 +798,14 @@ class DriveContent:
         dest = self.work_dir / f"{video.id}{suffix}"
         log.info("downloading %s (%s)", video.name, _size(video.size))
         style = self.frame_style_for(video)
+        plan = None
         try:
             original = self.client.download(video.id, dest, video.size)
             if style is not None:
                 before = probe(original)
+                plan = self.edit_plan(video, before.duration_s)
                 prepared = render_video(original, self.work_dir / f"{video.id}.framed.mp4", style, before,
-                                        self.work_dir, self.encode.timeout_seconds)
+                                        self.work_dir, self.encode.timeout_seconds, plan=plan)
                 after = probe(prepared)
             else:
                 prepared, before, after = prepare_for_upload(original, self.work_dir, self.encode_for(video))
@@ -627,7 +816,9 @@ class DriveContent:
         files = [original, prepared]
         where = self._stream_of.get(video.id)
         if where and self.app.brands[where[0]].streams[where[1]].cover == "random_frame":
-            cover = pick_cover(prepared, after.duration_s, self.work_dir)
+            # the closing logo clip is not the reel: the cover frame must come from what Moaz filmed
+            content_seconds = max(1.0, after.duration_s - (plan.outro_seconds if plan else 0.0))
+            cover = pick_cover(prepared, content_seconds, self.work_dir)
             if cover is not None:
                 self._covers[video.id] = cover
                 files.append(cover.image_path)

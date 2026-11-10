@@ -65,6 +65,23 @@ streams:
       upscale: false
     frame:                     # logo on top, the reel in a rounded window, source credit below (1080x1920)
       credit: "المصدر: معاذ عليان"
+    # Edits cut from the reel itself, so the upload is not a plain copy of the source (no text is added to the
+    # picture). Times come from the Whisper transcript of the audio check; the cold open sentence is chosen by
+    # the same language model, and a reel with no clearly suitable sentence simply gets none.
+    edits:
+      hook: { enabled: true, min_seconds: 1.5, max_seconds: 6, skip_first_seconds: 8 }   # cold open
+      zoom: { enabled: true, factor: 1.07, min_shot_seconds: 4 }                          # light punch-in cuts
+      # A decorative clip blended over the picture at 10%: one file per reel, the next file each time.
+      # Put any clips you have the right to use in the folder; black-background effects work best with `screen`.
+      overlay: { enabled: true, dir: "assets/kalima_sawaa/overlays", opacity: 0.10, blend: screen }
+      # A brighter line that travels around the window and closes exactly as the reel ends.
+      progress: { enabled: true, color: "#ffd98a", width: 9, glow: 6 }
+      # The logo animation closes every reel; it is sped up to keep the post under 178s, and left out when
+      # even x2.5 would not fit.
+      outro: { enabled: true, path: "assets/kalima_sawaa/outro.mp4", max_total_seconds: 178, max_speed: 2.5 }
+      # Slowly turning 10-fold Islamic rosettes in gold on the cream margins (scripts/make_pattern.py). Every
+      # line runs at a multiple of 36 degrees, so no two lines are ever perpendicular: no cross can form.
+      pattern: { enabled: true, path: "assets/kalima_sawaa/pattern.mp4", color: "#a47a3c", opacity: 0.50 }
     cover: random_frame        # cover/thumbnail = a random good frame (Instagram + TikTok/YouTube via Buffer)
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
   long:

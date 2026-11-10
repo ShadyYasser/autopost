@@ -136,6 +136,28 @@ sects, no generic tags like "دين" or "فيديو".
 Reply with ONLY one JSON object, no other text:
 {{"tags": ["<tag>", ...]}}"""
 
+HOOK_SYSTEM_PROMPT = """You choose the opening line of short Arabic reels on the channel "كلمة سواء": an \
+educational, interfaith-dialogue page (Islam, Christianity and comparative religion).
+{context}
+One sentence of the speaker will be played at the very start of the reel, before the reel itself, cut out of the \
+recording exactly as he says it. You get one JSON object: {{"title": "...", "transcript": "...", "candidates": \
+[{{"n": 1, "text": "..."}}, ...]}}. The transcript is automatic speech-to-text of spoken Arabic (often Egyptian \
+dialect) and can contain recognition mistakes; the candidates are pieces of it, in the order they are said.
+
+Pick the ONE candidate that works best as that opening line. It must pass ALL of these:
+- It is a complete sentence that a viewer understands on its own, without what was said before it. Not a fragment, \
+and not a sentence that starts with a word pointing back ("لأن", "وبالتالي", "يعني", "فـ", "ده معناه" ...) or ends \
+before its thought does.
+- It is the speaker's OWN question or OWN main point about the topic of the reel.
+- It is NOT him quoting, reading out or summarising a claim, a verse reading or an opinion that he goes on to \
+answer or reject, and not someone else speaking. Heard alone, it must not give the opposite impression of what the \
+reel says.
+- It has no insult, mockery or generalization about people or a religious group.
+If you are not sure that a candidate passes all of them, or none does, answer 0. Answering 0 is normal and safe.
+
+Reply with ONLY one JSON object, no other text:
+{{"n": <number of the chosen candidate, or 0>, "reason": "<short English reason>"}}"""
+
 # hashtags the templates already carry, and words that never belong in a topical tag
 RESERVED_TAGS = {"معاذ_عليان", "كلمة_سواء", "حوار_الأديان", "مقارنة_الأديان", "shorts"}
 _TAG_CHARS = re.compile(r"[^\w]", re.UNICODE)
@@ -419,6 +441,20 @@ class TitleGuard:
         payload = json.dumps({"title": title, "transcript": transcript[:MAX_TRANSCRIPT]}, ensure_ascii=False)
         text = self._ask(TAGS_SYSTEM_PROMPT.format(context=self._ctx, count=count), payload, 200, "hashtags")
         return clean_tags(_json_object(text).get("tags"), f"{title} {transcript}", count)
+
+    def pick_hook(self, title: str, transcript: str, candidates: list[str]) -> int | None:
+        """Index (0-based) of the candidate sentence to play as the cold open, or None when none is safe."""
+        if not candidates:
+            return None
+        payload = json.dumps({"title": title, "transcript": " ".join(transcript.split())[:MAX_TRANSCRIPT],
+                              "candidates": [{"n": i, "text": t} for i, t in enumerate(candidates, 1)]},
+                             ensure_ascii=False)
+        text = self._ask(HOOK_SYSTEM_PROMPT.format(context=self._ctx), payload, 200, "cold open")
+        try:
+            n = int(_json_object(text).get("n") or 0)
+        except (TypeError, ValueError):
+            return None
+        return n - 1 if 1 <= n <= len(candidates) else None
 
     def judge_audio(self, title: str, transcript: str) -> AudioVerdict:
         """Risk of what is said in the reel. An empty transcript (music, silence) is low risk without a model call."""
