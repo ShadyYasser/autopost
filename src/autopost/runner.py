@@ -25,7 +25,7 @@ from .content.text import render
 from .platforms.base import Outcome, Publisher, PublishContext, Services
 from .scheduler import ScheduleError, SlotPlan, plan_brand_day, slots_fingerprint
 from .secret_store import Secrets
-from .state import FINAL_DELIVERY, DeliveryRow, SlotRow, State
+from .state import FINAL_DELIVERY, REPOST_SUFFIX, DeliveryRow, SlotRow, State, base_stream
 
 log = logging.getLogger(__name__)
 
@@ -299,8 +299,44 @@ class Runner:
         if not chains and not self.state.posts_for_slot(brand.id, slot.slot_date, slot.slot):
             self.state.set_slot_status(brand.id, slot.slot_date, slot.slot, "skipped", now, note="no content")
             self.report.skipped.append(label)
+        elif brand.facebook_repost is not None:
+            try:
+                repost = self.start_repost(brand, slot, now, gap, busy=bool(chains))
+            except Exception:  # noqa: BLE001 - a re-post must never cost the slot its regular post
+                log.exception("%s: facebook re-post could not start", brand.id)
+                repost = None
+            if repost is not None:
+                chains.append(repost)
         self.checkpoint(f"start {brand.id} {slot.slot}")
         return chains
+
+    def start_repost(self, brand: BrandConfig, slot: SlotRow, now: datetime, gap: tuple[int, int],
+                     busy: bool) -> Chain | None:
+        """Re-post one video that went to Facebook while nobody could see it (Facebook only, same text)."""
+        cfg = brand.facebook_repost
+        for stream in brand.streams_for_slot(slot.slot):
+            if cfg.streams is not None and stream not in cfg.streams:
+                continue
+            if "facebook" not in brand.enabled_platforms(stream):
+                continue
+            for tries, row in enumerate(self.state.facebook_repost_candidates(brand.id, stream, cfg.before)):
+                if tries >= 3:
+                    break
+                video = self.content.video_by_id(brand.id, stream, row["source_id"])
+                if video is None:
+                    log.warning("%s/%s: re-post skipped, %s is no longer on Drive", brand.id, stream,
+                                row["source_name"])
+                    continue
+                variables = json.loads(row["variables_json"])
+                provider = brand.platform_for(stream, "facebook").provider
+                post_id = self.state.create_post(brand.id, stream + REPOST_SUFFIX, slot.slot_date, slot.slot,
+                                                 video.id, video.name, video.created, None, variables,
+                                                 [("facebook", provider)], now)
+                log.info("  post #%s %s/%s: Facebook re-post of %s", post_id, brand.id, stream, video.name)
+                ids = deque(d.id for d in self.state.deliveries(post_id))
+                ready = now + self.random_gap(gap) if busy else now
+                return Chain(brand, stream, slot, post_id, video, variables, ids, ready, gap)
+        return None
 
     def publishable(self, slot: SlotRow, now: datetime) -> bool:
         """Due slot that will really be published (not one about to be skipped as too late)."""
@@ -370,13 +406,14 @@ class Runner:
                             self.state.update_delivery(d.id, now, status="skipped_deadline", error="deadline passed")
                         self.finish_post(post["id"], slot, now)
                         continue
-                    video = self.content.video_by_id(brand.id, post["stream"], post["source_id"])
+                    stream = base_stream(post["stream"])
+                    video = self.content.video_by_id(brand.id, stream, post["source_id"])
                     if video is None:
                         log.error("post #%s: source video %s no longer available", post["id"], post["source_id"])
                         continue
                     variables = json.loads(post["variables_json"])
                     gap = self.gap_for(brand, slot.slot)
-                    chain = Chain(brand, post["stream"], slot, post["id"], video, variables,
+                    chain = Chain(brand, stream, slot, post["id"], video, variables,
                                   deque(d.id for d in open_ if d.status != "checking"), now, gap)
                     for d in open_:
                         if d.status == "checking":

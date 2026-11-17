@@ -44,6 +44,11 @@ streams:
     slots: [fajr, maghrib, third]
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
 
+# Until 2026-11-17 the Meta app was in development mode, so its Facebook reels reached nobody.
+# Every slot that publishes also re-posts one of those videos to Facebook only (oldest first, same caption).
+facebook_repost:
+  before: "2026-11-17T06:40:00+00:00"
+
 # Variables: {caption} {title}. Platform length limits are applied automatically.
 templates:
   facebook:  { text: "{caption}" }

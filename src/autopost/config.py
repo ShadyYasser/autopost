@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import string
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo
@@ -590,6 +591,19 @@ class StreamConfig(_Model):
         return self
 
 
+class FacebookRepostConfig(_Model):
+    """Facebook posts sent before `before` never reached anyone (the Meta app was in development mode).
+    Each slot that publishes also re-posts one of them to Facebook only, oldest first, with its original text."""
+
+    before: datetime
+    streams: list[str] | None = None       # None = every stream that publishes to Facebook
+
+    @field_validator("before")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+
+
 class BrandConfig(_Model):
     id: str
     name: str
@@ -604,6 +618,7 @@ class BrandConfig(_Model):
     streams: dict[str, StreamConfig] = Field(min_length=1)
     templates: dict[PlatformName, TemplateConfig]
     platforms: dict[PlatformName, PlatformConfig]
+    facebook_repost: FacebookRepostConfig | None = None
 
     @field_validator("comments", mode="before")
     @classmethod

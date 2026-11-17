@@ -386,3 +386,44 @@ def test_run_does_not_outlive_max_runtime_waiting_for_slow_checks(app, tmp_path)
     tiktok = [d for p in state.posts_for_slot("kalima_sawaa", TZ_DAY, "morning") for d in state.deliveries(p["id"])
               if d.platform == "tiktok"]
     assert [d.status for d in tiktok] == ["checking"]               # the next run resumes it
+
+
+def _seed_old_facebook_posts(state, app, n=3, sent=datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc), name="old"):
+    for i in range(n):
+        pid = state.create_post("takwin", "main", sent.date(), f"{name}{i}", f"{name}-{i}", f"{name}-{i}.mp4", None,
+                                None, {"caption": f"old caption {i}", "title": f"t{i}"},
+                                [("facebook", "direct"), ("instagram", "direct")], sent)
+        for d in state.deliveries(pid):
+            state.update_delivery(d.id, sent + timedelta(minutes=i), status="sent", external_id=f"fb{i}")
+
+
+def test_facebook_repost_sends_one_old_video_per_slot_to_facebook_only(app, tmp_path):
+    state = prepare_slots(app, tmp_path, "takwin")
+    _seed_old_facebook_posts(state, app)
+    s = slot(state, "takwin", "maghrib")
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target - timedelta(minutes=10),
+                                                         brand="takwin", state=state)
+    runner.run()
+    reposts = [c for c in pub.calls if c[5].get("text") == "old caption 0"]
+    assert [(c[1], c[2]) for c in reposts] == [("main", "facebook")]
+    regular = [c for c in pub.calls if c not in reposts]
+    assert sorted(c[2] for c in regular) == ["facebook", "instagram", "pinterest", "tiktok", "youtube"]
+    assert slot(state, "takwin", "maghrib").status == "done"
+    left = [r["source_id"] for r in state.facebook_repost_candidates("takwin", "main",
+                                                                     app.brands["takwin"].facebook_repost.before)]
+    assert [x for x in left if x.startswith("old")] == ["old-1", "old-2"]   # (the test day is before the cutoff)
+
+
+def test_facebook_repost_ignores_posts_after_cutoff_and_retries_failed_reposts(app, tmp_path):
+    state = State(tmp_path / "state.db")
+    cutoff = app.brands["takwin"].facebook_repost.before
+    _seed_old_facebook_posts(state, app, n=1)
+    _seed_old_facebook_posts(state, app, n=1, sent=cutoff + timedelta(hours=1), name="new")   # visible already
+    assert [r["source_id"] for r in state.facebook_repost_candidates("takwin", "main", cutoff)] == ["old-0"]
+    pid = state.create_post("takwin", "main~fb-repost", date(2026, 11, 18), "fajr", "old-0", "old-0.mp4", None,
+                            None, {}, [("facebook", "direct")], cutoff)
+    d = state.deliveries(pid)[0]
+    state.update_delivery(d.id, cutoff, status="gave_up")
+    assert [r["source_id"] for r in state.facebook_repost_candidates("takwin", "main", cutoff)] == ["old-0"]
+    state.update_delivery(d.id, cutoff, status="sent")
+    assert state.facebook_repost_candidates("takwin", "main", cutoff) == []

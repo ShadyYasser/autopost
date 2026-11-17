@@ -106,6 +106,12 @@ CREATE TABLE IF NOT EXISTS early_deliveries (
 """
 
 FINAL_DELIVERY = {"sent", "manual", "gave_up", "skipped_deadline"}
+# Facebook re-posts are stored as posts of stream "<stream>~fb-repost" (own slot key, own used-video set).
+REPOST_SUFFIX = "~fb-repost"
+
+
+def base_stream(stream: str) -> str:
+    return stream.removesuffix(REPOST_SUFFIX)
 
 
 def to_utc_str(dt: datetime) -> str:
@@ -326,6 +332,25 @@ class State:
         return [r[0] for r in rows]
 
     # ------------------------------------------------------------ caption cursor
+
+    def facebook_repost_candidates(self, brand: str, stream: str, before: datetime) -> list[sqlite3.Row]:
+        """Videos sent to Facebook before `before` that have no live re-post yet, oldest first.
+        A re-post that gave up or missed its deadline does not count, so the video is tried again."""
+        cut = to_utc_str(before)
+        return self._exec(
+            "SELECT source_id, source_name, variables_json, MIN(sent_utc) AS sent_utc FROM ("
+            " SELECT p.source_id, p.source_name, p.variables_json, d.updated_utc AS sent_utc"
+            " FROM posts p JOIN deliveries d ON d.post_id=p.id"
+            " WHERE p.brand=? AND p.stream=? AND d.platform='facebook' AND d.status='sent' AND d.updated_utc<?"
+            " UNION ALL"
+            " SELECT source_id, source_id, variables_json, delivered_utc FROM early_deliveries"
+            " WHERE brand=? AND stream=? AND platform='facebook' AND status='sent' AND delivered_utc<?)"
+            " WHERE source_id NOT IN ("
+            "  SELECT p2.source_id FROM posts p2 JOIN deliveries d2 ON d2.post_id=p2.id"
+            "  WHERE p2.brand=? AND p2.stream=? AND d2.platform='facebook'"
+            "  AND d2.status NOT IN ('gave_up','skipped_deadline'))"
+            " GROUP BY source_id ORDER BY sent_utc",
+            (brand, stream, cut, brand, stream, cut, brand, stream + REPOST_SUFFIX)).fetchall()
 
     def caption_cursor(self, brand: str) -> tuple[int, datetime] | None:
         """(last sheet row used, when) or None."""
