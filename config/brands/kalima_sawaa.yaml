@@ -45,7 +45,7 @@ title_guard:
   block_levels: [high]
   audio:
     enabled: true
-    streams: [short]           # long videos are not transcribed
+    streams: [short, own]      # long videos are not transcribed
     whisper_model: large-v3    # large-v3-turbo is ~4x faster and a little less accurate
     max_seconds: 180
   context: |
@@ -56,7 +56,7 @@ streams:
   short:                       # filled by tg2drive (ShadyYasser/tg2drive) from the Telegram group
     drive_folder_id: "1qf_opI5CAtrP5iDn3goNxAZY23rj7Z4c"
     order: newest_first        # every slot posts the newest unposted reel (highest Telegram msg_id)
-    slots: [morning, afternoon, evening, night]
+    slots: [afternoon, night]  # morning + evening belong to `own` and fall back to this stream when it is empty
     backfill:                  # daily-summary stats only: new reels vs the initial 400
       size: 400                # its last msg_id is fixed in state once 400 reels are in the folder
       boundary_msg_id: null    # or set the last backfill msg_id here by hand
@@ -87,6 +87,25 @@ streams:
       pattern: { enabled: true, path: "assets/kalima_sawaa/pattern.mp4", color: "#a47a3c", opacity: 0.50 }
     cover: random_frame        # cover/thumbnail = a random good frame (Instagram + TikTok/YouTube via Buffer)
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
+  # Your own reels (Drive folder "own", next to "short"): the morning and evening slots post from here, oldest
+  # upload first. When the folder has no unposted reel, the slot posts the next reel of `short` instead.
+  # Same frame and source line as `short`; no zoom cuts and no overlay effect.
+  own:
+    drive_folder_id: "1xh6w-G-g0cA9o-go5MAUD4kFSFDsRV2b"
+    order: created_time
+    slots: [morning, evening]
+    fallback: short
+    media:
+      transcode: codec_only
+      upscale: false
+    frame:
+      credit: "المصدر: معاذ عليان"
+    edits:                     # no hook, zoom or overlay
+      progress: { enabled: true, color: "#ffd98a", width: 9, glow: 6 }
+      outro: { enabled: true, path: "assets/kalima_sawaa/outro.mp4", max_total_seconds: 178, max_speed: 2.5 }
+      pattern: { enabled: true, path: "assets/kalima_sawaa/pattern.mp4", color: "#a47a3c", opacity: 0.50 }
+    cover: random_frame
+    platforms: [facebook, instagram, tiktok, youtube, pinterest]
   long:
     drive_folder_id: "1MKCjqE2rKpeT3dGfYtwe7LmYhnZ6CGdP"
     slots: [night]             # the 22:00 slot posts BOTH a short and a long video
@@ -105,7 +124,8 @@ templates:
   facebook:  { text: "{title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان{tags}" }
   instagram: { text: "{title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان #مقارنة_الأديان{tags}" }
   tiktok:    { text: "{title} #معاذ_عليان #كلمة_سواء #حوار_الأديان{tags}" }
-  youtube:   { title: "{title}", description: "{title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان{tags} #Shorts" }
+  # YouTube: {source_title} = the file name's own wording (what people search for), unless the check blocked it
+  youtube:   { title: "{source_title}", description: "{source_title}\n\nالمصدر: معاذ عليان\n#معاذ_عليان #كلمة_سواء #حوار_الأديان{tags} #Shorts" }
   pinterest: { title: "{title}", description: "{title}\n\nالمصدر: معاذ عليان" }
 
 platforms:
