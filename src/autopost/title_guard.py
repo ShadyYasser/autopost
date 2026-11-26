@@ -28,6 +28,9 @@ from .content.text import cut_words
 
 log = logging.getLogger(__name__)
 
+RETRY_NOTE = ("\n\nReply with ONE JSON object only, in exactly the format described above, "
+              "and always include the \"risk\" key.")
+
 ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
 RETRY_STATUS = (408, 409, 429, 500, 502, 503, 504, 529)
@@ -242,6 +245,18 @@ def clean_obfuscation(title: str) -> str:
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
+_RISK_KEYS = ("risk", "risk_level", "level", "verdict")
+
+
+def _risk(data: dict) -> str:
+    """The risk value of a model reply, tolerating a differently cased or named key and stray spaces."""
+    lowered = {str(k).strip().lower(): v for k, v in data.items()}
+    for key in _RISK_KEYS:
+        if lowered.get(key) not in (None, ""):
+            return str(lowered[key]).strip().lower()
+    return ""
+
+
 def _json_object(text: str) -> dict:
     text = _THINK.sub("", text)
     m = re.search(r"\{.*\}", text, re.DOTALL)
@@ -258,7 +273,7 @@ def _json_object(text: str) -> dict:
 
 def parse_audio_reply(text: str, transcript: str) -> AudioVerdict:
     data = _json_object(text)
-    risk = str(data.get("risk", "")).lower()
+    risk = _risk(data)
     if risk not in RISKS:
         raise GuardError(f"unknown risk {data.get('risk')!r}")
     reasons = tuple(str(r)[:300] for r in (data.get("reasons") or [])[:5])
@@ -273,7 +288,7 @@ def parse_reply(text: str, original: str) -> Verdict:
         data = json.loads(m.group(0))
     except json.JSONDecodeError as exc:
         raise GuardError(f"bad JSON in the model reply: {exc}") from exc
-    risk = str(data.get("risk", "")).lower()
+    risk = _risk(data)
     if risk not in RISKS:
         raise GuardError(f"unknown risk {data.get('risk')!r}")
     reasons = tuple(str(r)[:200] for r in (data.get("reasons") or [])[:5])
@@ -289,7 +304,7 @@ def parse_reply(text: str, original: str) -> Verdict:
 
 def parse_retitle_reply(text: str, original: str) -> Verdict:
     data = _json_object(text)
-    risk = str(data.get("risk", "")).lower()
+    risk = _risk(data)
     if risk not in ("low", "high"):
         raise GuardError(f"unknown risk {data.get('risk')!r}")
     reasons = tuple(str(r)[:200] for r in (data.get("reasons") or [])[:5])
@@ -419,10 +434,21 @@ class TitleGuard:
                 self.sleep(2 ** attempt * 2)
         raise GuardError(f"{what} failed: {last}")
 
+    def _ask_parsed(self, system: str, user: str, max_tokens: int, what: str, parse):
+        """Ask and parse. A reply that cannot be parsed (no JSON, no valid "risk") is asked once more with a
+        reminder: the local model answers at temperature 0, so the same question would get the same reply."""
+        text = self._ask(system, user, max_tokens, what)
+        try:
+            return parse(text)
+        except GuardError as exc:
+            log.warning("%s: unusable reply (%s); asking once more", what, exc)
+        text = self._ask(system, user + RETRY_NOTE, max_tokens, what)
+        return parse(text)
+
     def judge(self, title: str) -> Verdict:
         original = clean_obfuscation(title)
-        text = self._ask(self.system, json.dumps({"title": original}, ensure_ascii=False), 500, "title check")
-        return parse_reply(text, original)
+        return self._ask_parsed(self.system, json.dumps({"title": original}, ensure_ascii=False), 500,
+                                "title check", lambda text: parse_reply(text, original))
 
     def retitle(self, original_title: str, transcript: str) -> Verdict:
         """A new, clean title for a reel whose own title cannot be posted: from the title's neutral core when it
@@ -430,8 +456,8 @@ class TitleGuard:
         original = clean_obfuscation(original_title)
         payload = json.dumps({"original_title": original, "transcript": " ".join(transcript.split())[:MAX_TRANSCRIPT]},
                              ensure_ascii=False)
-        text = self._ask(self.retitle_system, payload, 500, "retitle")
-        return parse_retitle_reply(text, original)
+        return self._ask_parsed(self.retitle_system, payload, 500, "retitle",
+                                lambda text: parse_retitle_reply(text, original))
 
     def hashtags(self, title: str, transcript: str, count: int = 2) -> list[str]:
         """Up to `count` topical hashtags (no '#') for a reel, each grounded in its title or transcript."""
@@ -462,5 +488,5 @@ class TitleGuard:
         if len(transcript) < 8:
             return AudioVerdict("low", ("no speech found",), transcript)
         payload = json.dumps({"title": title, "transcript": transcript[:MAX_TRANSCRIPT]}, ensure_ascii=False)
-        text = self._ask(self.audio_system, payload, 400, "audio check")
-        return parse_audio_reply(text, transcript)
+        return self._ask_parsed(self.audio_system, payload, 400, "audio check",
+                                lambda text: parse_audio_reply(text, transcript))

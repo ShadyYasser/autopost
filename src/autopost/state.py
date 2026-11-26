@@ -155,9 +155,7 @@ class State:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
+        self.db = self._connect()
         self.db.executescript(SCHEMA)
         row = self.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if row is None:
@@ -165,8 +163,21 @@ class State:
         elif int(row["value"]) > SCHEMA_VERSION:
             raise RuntimeError(f"state.db schema {row['value']} is newer than this code ({SCHEMA_VERSION})")
 
+    def _connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys = ON")
+        return db
+
     def close(self) -> None:
         self.db.close()
+
+    def reopen(self) -> None:
+        """Connect again to the file now at `path`. scripts/commit_state.sh may replace state.db (git reset +
+        merge on a push conflict); a connection left on the old file then fails with "attempt to write a
+        readonly database" (SQLITE_READONLY_DBMOVED)."""
+        self.db.close()
+        self.db = self._connect()
 
     @contextmanager
     def transaction(self) -> Iterator[None]:

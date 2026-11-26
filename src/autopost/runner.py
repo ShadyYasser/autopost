@@ -137,7 +137,12 @@ class Runner:
 
     def checkpoint(self, reason: str) -> None:
         if self._checkpoint and not self.dry_run:
-            self._checkpoint(reason)
+            # The commit script can swap state.db for a merged copy: close first, then reopen whatever is there.
+            self.state.close()
+            try:
+                self._checkpoint(reason)
+            finally:
+                self.state.reopen()
 
     def too_late(self, brand: BrandConfig, slot: str, target: datetime, deadline: datetime | None,
                  now: datetime) -> str | None:
