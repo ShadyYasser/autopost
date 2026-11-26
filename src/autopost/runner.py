@@ -245,6 +245,12 @@ class Runner:
         for stream in brand.streams_for_slot(slot.slot):
             try:
                 video = self.content.next_video(brand.id, stream, slot=slot.slot)
+                fallback = brand.streams[stream].fallback
+                if video is None and fallback is not None:
+                    log.info("%s/%s: no unposted video; slot %s posts from '%s' instead",
+                             brand.id, stream, slot.slot, fallback)
+                    stream = fallback
+                    video = self.content.next_video(brand.id, stream, slot=slot.slot)
                 if video is None:
                     self.notifier.alert(
                         f"{brand.name}: no unposted videos left in stream '{stream}'. Slot {slot.slot} skipped for it.",
@@ -377,8 +383,10 @@ class Runner:
                 log.warning("prefetch for %s/%s failed: %s", brand.id, stream, exc)
 
     def warn_low_content(self, brand: BrandConfig, stream: str, now: datetime) -> None:
+        if brand.streams[stream].fallback is not None:
+            return                                   # an empty stream with a fallback is normal
         remaining = self.content.remaining(brand.id, stream)
-        per_day = len(brand.streams[stream].slots)
+        per_day = brand.slots_per_day(stream)
         days = remaining / per_day
         if days <= self.settings.low_content_warning_days:
             self.notifier.alert(

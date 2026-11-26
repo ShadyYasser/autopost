@@ -319,7 +319,7 @@ def cmd_sources(args, app: AppConfig) -> int:
                     print(f"  ✗ {stream_name}: {exc}")
                     problems += 1
                     continue
-                per_day = len(stream.slots)
+                per_day = brand.slots_per_day(stream_name)
                 used_ids = state.used_source_ids(brand.id, stream_name)
                 used = sum(1 for v in listing if v.id in used_ids)
                 skipped = [v.name for v in listing if v.id not in used_ids and content.skipped_title(brand.id, stream_name, v)]

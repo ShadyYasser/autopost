@@ -359,7 +359,9 @@ class FilenameTextSource(_Model):
     skip_titles: list[str] = Field(default_factory=list)
 
     def variables(self) -> set[str]:
-        return {"title", "tags"}      # tags: " #topic #topic" from the speech, or "" (see DriveContent.pick_text)
+        # tags: " #topic #topic" from the speech, or "" (see DriveContent.pick_text)
+        # source_title: the file-name title as it is (only cleaned), unless the check blocked it; else = title
+        return {"title", "tags", "source_title"}
 
 
 TextSource = Annotated[Union[SheetTextSource, FilenameTextSource], Field(discriminator="type")]
@@ -583,6 +585,9 @@ class StreamConfig(_Model):
     edits: EditsConfig | None = None
     # random_frame: cover/thumbnail = a random good frame of the video (Instagram, and TikTok/YouTube via Buffer)
     cover: Literal["none", "random_frame"] = "none"
+    # Another stream of the brand that posts in this stream's slots while this one has no unposted video left
+    # (with its own frame, edits, texts and platforms). No "empty" or "low content" alert for this stream.
+    fallback: str | None = None
 
     @model_validator(mode="after")
     def _folder(self) -> "StreamConfig":
@@ -641,6 +646,11 @@ class BrandConfig(_Model):
 
     def enabled_platforms(self, stream: str) -> list[str]:
         return [p for p in self.streams[stream].platforms if self.platform_for(stream, p).enabled]
+
+    def slots_per_day(self, stream: str) -> int:
+        """Videos a stream can use per day: its own slots plus those of streams that fall back to it."""
+        return len(self.streams[stream].slots) + sum(
+            len(s.slots) for s in self.streams.values() if s.fallback == stream)
 
     def streams_for_slot(self, slot: str) -> list[str]:
         return [name for name, s in self.streams.items() if slot in s.slots]
@@ -744,6 +754,11 @@ def validate_brand(brand: BrandConfig, settings: Settings) -> list[str]:
                 errors.append(f"{sp}: edits.outro file not found: {e.outro.path}")
             if e.pattern and e.pattern.enabled and not resolve_asset(e.pattern.path).is_file():
                 errors.append(f"{sp}: edits.pattern file not found: {e.pattern.path}")
+        if stream.fallback is not None:
+            if stream.fallback == name or stream.fallback not in brand.streams:
+                errors.append(f"{sp}: fallback {stream.fallback!r} is not another stream of this brand")
+            elif brand.streams[stream.fallback].fallback is not None:
+                errors.append(f"{sp}: fallback stream {stream.fallback!r} must not have a fallback itself")
         for slot in stream.slots:
             if slot not in brand.slots:
                 errors.append(f"{sp}: unknown slot {slot!r} (defined: {sorted(brand.slots)})")

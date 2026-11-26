@@ -47,8 +47,9 @@ def build_daily_summary(app: AppConfig, state: State, content, day: date, now: d
             except Exception as exc:  # noqa: BLE001
                 lines.append(f"  المتبقي ({stream_name}): غير معروف ({exc})")
                 continue
-            days = left / max(1, len(stream.slots))
-            warn = " ⚠️ أضف محتوى" if days <= app.settings.low_content_warning_days else ""
+            days = left / max(1, brand.slots_per_day(stream_name))
+            low = days <= app.settings.low_content_warning_days and stream.fallback is None   # empty `own` is normal
+            warn = " ⚠️ أضف محتوى" if low else ""
             lines.append(f"  المتبقي ({stream_name}): {left} فيديو ≈ {days:.0f} يوم{warn}")
             stats = getattr(content, "stream_stats", lambda *a: None)(brand.id, stream_name, day)
             if stats:
