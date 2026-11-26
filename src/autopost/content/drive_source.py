@@ -876,16 +876,19 @@ class DriveContent:
             title = title_from_filename(video.name, src.strip_prefixes, src.replacements)
             if not title:
                 raise ContentError(f"empty title from file name {video.name!r}")
+            source_title = title
             verdict = self.verdict(brand, video)
             if verdict is not None:
-                title = verdict.title
+                title = source_title = verdict.title
                 cfg = self.app.brands[brand].title_guard
                 if verdict.risk in cfg.block_levels:           # only reached with a clean replacement title
                     new = self.cached_retitle(brand, video) if self.audio_on(brand, stream) else None
                     if new is None or new.risk in cfg.block_levels:
                         raise ContentError(f"{video.name}: the title is blocked and has no replacement")
-                    title = new.title
-            variables = {"title": title}
+                    title = source_title = new.title
+                else:
+                    source_title = verdict.original or title   # the creator's own wording, only cleaned
+            variables = {"title": title, "source_title": source_title}
             if self.tags_wanted(brand, stream):
                 variables["tags"] = "".join(" #" + t for t in self.cached_tags(brand, video) or [])
             return TextChoice(variables=variables)

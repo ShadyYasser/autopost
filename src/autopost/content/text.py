@@ -120,7 +120,7 @@ def render(template: TemplateConfig, platform: str, variables: dict[str, str],
            limits: dict[str, dict[str, int]] | None = None) -> dict[str, str]:
     out = {}
     for field in TEMPLATE_FIELDS[platform]:
-        raw = getattr(template, field).format_map({"tags": "", **variables})     # {tags}: topical hashtags, if any
+        raw = getattr(template, field).format_map({"tags": "", "source_title": variables.get("title", ""), **variables})     # {tags}: topical hashtags, if any
         out[field] = limit_field(platform, field, raw, limits)
     return out
 
