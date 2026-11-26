@@ -177,7 +177,8 @@ def test_dry_run_never_writes_the_sheet_but_still_rotates(app, tmp_path):
 def test_filename_titles_for_kalima(app, tmp_path):
     content, _, _ = make(app, tmp_path)
     v = VideoItem(id="x", name="Copy of حوار ناري：القس.mp4", created=None)
-    assert content.pick_text("kalima_sawaa", "long", v).variables == {"title": "حوار ناري:القس"}
+    assert content.pick_text("kalima_sawaa", "long", v).variables == {"title": "حوار ناري:القس",
+                                                                       "source_title": "حوار ناري:القس"}
 
 
 def test_fetch_and_release(app, tmp_path, monkeypatch):

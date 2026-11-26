@@ -95,7 +95,7 @@ def test_captionless_file_is_skipped_with_one_alert(app, tmp_path):
 def test_slash_restored_other_characters_kept(app, tmp_path):
     content, _, _ = make(app, tmp_path)
     v = VideoItem(id="x", name="هل هو إله؟ نعم/لا ⧸ القس: يوحنا | الجزء 2.mp4", created=None)
-    assert content.pick_text("kalima_sawaa", "short", v).variables == {"title": "هل هو إله؟ نعم/لا / القس: يوحنا | الجزء 2"}
+    assert content.pick_text("kalima_sawaa", "short", v).variables["title"] == "هل هو إله؟ نعم/لا / القس: يوحنا | الجزء 2"
 
 
 def test_posts_of_deleted_files_do_not_change_counts(app, tmp_path):

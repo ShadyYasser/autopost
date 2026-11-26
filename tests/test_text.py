@@ -107,3 +107,11 @@ def test_kalima_long_title_capped_at_100():
     assert utf16_len(yt["title"]) <= 100 and yt["description"] == title
     fb = render(TemplateConfig(text="{title}"), "facebook", v)
     assert fb["text"] == title
+
+
+def test_source_title_defaults_to_title_for_older_posts():
+    from autopost.config import TemplateConfig
+    from autopost.content.text import render
+    out = render(TemplateConfig(title="{source_title}", description="{source_title} {title}"), "youtube",
+                 {"title": "عنوان"})
+    assert out["title"] == "عنوان" and out["description"] == "عنوان عنوان"

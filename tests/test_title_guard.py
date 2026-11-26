@@ -93,7 +93,9 @@ def test_caption_uses_the_rewritten_title(app, tmp_path):
                                                        "reasons": ["mockery"]}})
     content, _, _ = make(app, tmp_path, guard=guard)
     v = VideoItem(id="x", name="مسيحي اخترع نص جديد 😂.mp4", created=None)
-    assert content.pick_text("kalima_sawaa", "short", v).variables == {"title": "نص جديد في الميزان"}
+    # YouTube gets the creator's own wording (search), the other platforms the rewritten title
+    assert content.pick_text("kalima_sawaa", "short", v).variables == {"title": "نص جديد في الميزان",
+                                                                       "source_title": "مسيحي اخترع نص جديد 😂"}
 
 
 def test_api_failure_posts_nothing(app, tmp_path, monkeypatch):

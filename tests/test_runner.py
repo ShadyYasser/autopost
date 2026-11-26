@@ -205,12 +205,37 @@ def test_out_of_content_alerts_and_skips(app, tmp_path):
 
 def test_low_content_warning(app, tmp_path):
     state = prepare_slots(app, tmp_path, "kalima_sawaa")
+    s = slot(state, "kalima_sawaa", "afternoon")
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target, brand="kalima_sawaa",
+                                                         state=state, content=FakeContent(count=6))
+    runner.run()
+    # short stream: 5 left after this post, 4 per day (its 2 slots + the 2 of `own`, which falls back) → 1.2 days
+    assert any("only 5 unposted" in m for m in notifier.sent)
+
+
+def test_own_slot_posts_from_own_folder(app, tmp_path):
+    state = prepare_slots(app, tmp_path, "kalima_sawaa")
     s = slot(state, "kalima_sawaa", "morning")
     runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target, brand="kalima_sawaa",
-                                                         state=state, content=FakeContent(count=8))
+                                                         state=state, content=FakeContent(count=1))
     runner.run()
-    # short stream: 7 left after this post, 3 per day → 2.3 days ≤ 3
-    assert any("only 7 unposted" in m for m in notifier.sent)
+    assert {c[1] for c in pub.calls} == {"own"}
+    assert content.remaining("kalima_sawaa", "short") == 1
+
+
+def test_empty_own_folder_falls_back_to_short_quietly(app, tmp_path):
+    state = prepare_slots(app, tmp_path, "kalima_sawaa")
+    s = slot(state, "kalima_sawaa", "evening")
+    content = FakeContent()
+    content.videos[("kalima_sawaa", "own")] = []
+    runner, state, clock, content, pub, notifier = make(app, tmp_path, s.target, brand="kalima_sawaa",
+                                                         state=state, content=content)
+    runner.run()
+    assert {c[1] for c in pub.calls} == {"short"}
+    assert {c[2] for c in pub.calls} == {"facebook", "instagram", "tiktok", "youtube", "pinterest"}
+    assert state.posts_for_slot("kalima_sawaa", TZ_DAY, "evening")[0]["stream"] == "short"
+    assert not any("no unposted" in m or "only" in m for m in notifier.sent)
+    assert slot(state, "kalima_sawaa", "evening").status == "done"
 
 
 def test_late_regular_slot_is_skipped(app, tmp_path):
@@ -296,7 +321,7 @@ def test_busy_run_picks_up_a_prayer_slot_that_becomes_due(app, tmp_path):
 
 def test_early_test_deliveries_are_skipped_and_texts_reused(app, tmp_path):
     state = prepare_slots(app, tmp_path, "kalima_sawaa")
-    s = slot(state, "kalima_sawaa", "morning")
+    s = slot(state, "kalima_sawaa", "afternoon")
     content = FakeContent()
     first = content._pool("kalima_sawaa", "short")[0]
     state.record_early_delivery("kalima_sawaa", "short", first.id, "facebook", "direct", "sent", "FB1",
@@ -309,7 +334,7 @@ def test_early_test_deliveries_are_skipped_and_texts_reused(app, tmp_path):
     platforms = sorted(c[2] for c in pub.calls)
     assert platforms == ["pinterest", "tiktok", "youtube"]
     assert all(c[5].get("title", c[5].get("text")).startswith("from the test") for c in pub.calls)
-    post = state.posts_for_slot("kalima_sawaa", TZ_DAY, "morning")[0]
+    post = state.posts_for_slot("kalima_sawaa", TZ_DAY, "afternoon")[0]
     d = {x.platform: x for x in state.deliveries(post["id"])}
     assert d["facebook"].status == "sent" and d["facebook"].url == "https://fb/1"
     assert post["status"] == "done"
