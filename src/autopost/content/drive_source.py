@@ -116,6 +116,34 @@ def order_by_name_number(items: list[VideoItem]) -> tuple[list[VideoItem], list[
     return numbered + unnumbered, unnumbered
 
 
+# "B - title.mp4", "4 - title.mp4": an ordering label in front of the title (order: label)
+_LABEL = re.compile(r"^\s*([0-9]{1,4}|[A-Za-z]{1,3})\s*[-–]\s+")
+
+
+def name_label(name: str) -> str | None:
+    m = _LABEL.match(Path(name).stem)
+    return m.group(1) if m else None
+
+
+def strip_label(title: str) -> str:
+    return _LABEL.sub("", title, count=1)
+
+
+def order_by_label(items: list[VideoItem]) -> list[VideoItem]:
+    """Numbered labels first (1, 2, ... 10), then letters (A, B, ... Z, AA), then files without a label,
+    oldest uploaded first."""
+    latest = datetime.max.replace(tzinfo=ZoneInfo("UTC"))
+
+    def key(v: VideoItem):
+        label = name_label(v.name)
+        if label is None:
+            return (2, 0, "", v.created or latest, v.id)
+        if label.isdigit():
+            return (0, int(label), "", v.created or latest, v.id)
+        return (1, len(label), label.upper(), v.created or latest, v.id)
+    return sorted(items, key=key)
+
+
 def order_newest_first(items: list[VideoItem]) -> list[VideoItem]:
     """Highest Telegram msg_id first; files without one after them, newest createdTime first."""
     oldest = datetime.min.replace(tzinfo=ZoneInfo("UTC"))
@@ -222,6 +250,8 @@ class DriveContent:
             order = self.app.brands[brand].streams[stream].order
             if order == "newest_first":
                 items = order_newest_first(items)
+            if order == "label":
+                items = order_by_label(items)
             if order == "name_number":
                 items, unnumbered = order_by_name_number(items)
                 if unnumbered:
@@ -266,10 +296,18 @@ class DriveContent:
             return AnthropicBackend(key_value, cfg.model, self._guard_session)
         return OpenAICompatBackend(cfg.base_url, key_value, cfg.model, self._guard_session)
 
-    def _guard_key(self, brand: str, video: VideoItem) -> tuple[str, str]:
-        """(state key, the title that is judged). The key includes the title, so renaming a file re-checks it."""
+    def file_title(self, brand: str, video: VideoItem) -> str:
+        """The title written in the file name; without its ordering label in a stream ordered by label."""
         src = self.app.brands[brand].text_source
         title = title_from_filename(video.name, src.strip_prefixes, src.replacements)
+        where = self._stream_of.get(video.id)
+        if where and self.app.brands[where[0]].streams[where[1]].order == "label":
+            title = strip_label(title)
+        return title
+
+    def _guard_key(self, brand: str, video: VideoItem) -> tuple[str, str]:
+        """(state key, the title that is judged). The key includes the title, so renaming a file re-checks it."""
+        title = self.file_title(brand, video)
         return f"guard:{brand}:{video.id}:{hashlib.sha1(title.encode()).hexdigest()[:10]}", title
 
     def verdict(self, brand: str, video: VideoItem) -> Verdict | None:
@@ -763,7 +801,7 @@ class DriveContent:
         src = self.app.brands[brand].text_source
         if not isinstance(src, FilenameTextSource) or not src.skip_titles:
             return False
-        title = title_from_filename(video.name, src.strip_prefixes, src.replacements).strip()
+        title = self.file_title(brand, video).strip()
         if title not in {t.strip() for t in src.skip_titles}:
             return False
         if video.id not in self._skipped:
@@ -957,7 +995,7 @@ class DriveContent:
     def pick_text(self, brand: str, stream: str, video: VideoItem) -> TextChoice:
         src = self.app.brands[brand].text_source
         if isinstance(src, FilenameTextSource):
-            title = title_from_filename(video.name, src.strip_prefixes, src.replacements)
+            title = self.file_title(brand, video)
             if not title:
                 raise ContentError(f"empty title from file name {video.name!r}")
             source_title = title
