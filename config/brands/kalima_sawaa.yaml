@@ -91,12 +91,13 @@ streams:
       verses: { enabled: true, blur: 26 }
     cover: random_frame        # cover/thumbnail = a random good frame (Instagram + TikTok/YouTube via Buffer)
     platforms: [facebook, instagram, tiktok, youtube, pinterest]
-  # Your own reels (Drive folder "own", next to "short"): the morning and evening slots post from here, oldest
-  # upload first. When the folder has no unposted reel, the slot posts the next reel of `short` instead.
+  # Your own reels (Drive folder "own", next to "short"): the morning and evening slots post from here, in the
+  # order of the label in front of each file name. When the folder has no unposted reel, the slot posts the next
+  # reel of `short` instead.
   # Same frame and source line as `short`; no zoom cuts and no overlay effect.
   own:
     drive_folder_id: "1xh6w-G-g0cA9o-go5MAUD4kFSFDsRV2b"
-    order: created_time
+    order: label               # "4 - title", "B - title": numbers first, then letters; the label is not in the title
     slots: [morning, evening]
     fallback: short
     media:
