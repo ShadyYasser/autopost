@@ -189,6 +189,7 @@ def input_order(plan: EditPlan) -> dict[str, int]:
     order += ["overlay", "mask"] if plan.overlay else []
     order += (["outro"] if plan.outro else []) + (["pattern", "pmask"] if plan.pattern else [])
     order += (["ring"] if plan.progress else []) + ["layer"]
+    order += [f"card{i}" for i in range(len(plan.cards))]
     return {name: i for i, name in enumerate(order)}
 
 
@@ -264,7 +265,44 @@ def frame_filter(style: FrameStyle, rect: tuple[int, int, int, int], plan: EditP
                      f"[cutr][ovm]blend=all_mode={o.blend}:all_opacity={o.opacity:.3f}:shortest=1,"
                      f"format=yuv420p[body]")
     else:
-        parts.append("[cut]null[body]")
+        parts.append("[cut]null[body0]" if plan.cards else "[cut]null[body]")
+    if plan.overlay is not None and plan.cards:
+        parts[-1] = parts[-1][: -len("[body]")] + "[body0]"
+
+    if plan.cards:
+        # while a verse is read: the reel is blurred (and a little darker) and the verse card lies on top.
+        # One blurred copy runs alongside the reel (cheap: blurred at 1/6 size), never trimmed, so nothing
+        # is buffered; each card gets its own alpha fades on that copy and its own card image.
+        n = len(plan.cards)
+        fade = 0.35
+        sw, sh = _even(w / 6), _even(h / 6)
+        sigma = max(1.0, plan.card_blur / 6)
+        # cards less than a second apart share one blur, so the picture does not flicker sharp between them
+        spans: list[list[float]] = []
+        for c in plan.cards:
+            a, b = c.start + plan.hook_seconds, c.start + plan.hook_seconds + max(0.8, c.end - c.start)
+            if spans and a - spans[-1][1] < 1.0:
+                spans[-1][1] = max(spans[-1][1], b)
+            else:
+                spans.append([a, b])
+        m = len(spans)
+        parts.append(f"[body0]split=2[bm][bx];[bx]scale={sw}:{sh}:flags=bilinear,gblur=sigma={sigma:.2f},"
+                     f"scale={w}:{h}:flags=bicubic,eq=brightness=-0.06,format=yuva420p"
+                     + (f",split={m}" if m > 1 else "") + "".join(f"[bx{j}]" for j in range(m)))
+        cur = "bm"
+        for j, (a, b) in enumerate(spans):
+            parts.append(f"[bx{j}]fade=t=in:st={a:.3f}:d={fade}:alpha=1,"
+                         f"fade=t=out:st={max(a, b - fade):.3f}:d={fade}:alpha=1[bl{j}];"
+                         f"[{cur}][bl{j}]overlay=0:0:enable='between(t,{a:.3f},{b:.3f})'[cb{j}]")
+            cur = f"cb{j}"
+        for i, c in enumerate(plan.cards):
+            a = c.start + plan.hook_seconds
+            d = max(0.8, c.end - c.start)
+            parts.append(f"[{idx[f'card{i}']}:v]format=rgba,fps={style.fps},fade=t=in:st=0:d={fade}:alpha=1,"
+                         f"fade=t=out:st={max(0.0, d - fade):.3f}:d={fade}:alpha=1,setpts=PTS+{a:.3f}/TB[cd{i}];"
+                         f"[{cur}][cd{i}]overlay=0:0:eof_action=pass:format=auto[cv{i}]")
+            cur = f"cv{i}"
+        parts.append(f"[{cur}]format=yuv420p[body]")
 
     if plan.outro is not None:
         speed = plan.outro.speed
@@ -355,6 +393,15 @@ def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_
     if ring is not None:
         inputs += ["-framerate", str(ring.fps), "-i", str(ring.pattern)]
     inputs += ["-framerate", str(style.fps), "-loop", "1", "-i", str(layer_path)]
+    card_paths = []
+    if plan.cards:
+        from .cards import render_card
+        for i, c in enumerate(plan.cards):
+            path = work_dir / f"{src.stem}.card{i}.png"
+            render_card(c, (rect[2], rect[3])).save(path)
+            card_paths.append(path)
+            inputs += ["-framerate", str(style.fps), "-loop", "1", "-t", f"{max(0.8, c.end - c.start):.3f}",
+                       "-i", str(path)]
 
     has_audio = info.acodec is not None
     cut_audio = has_audio and (plan.hook is not None or plan.outro is not None)
@@ -374,7 +421,9 @@ def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_
         f"; overlay {plan.overlay.path.name} at {plan.overlay.opacity:.0%}" if plan.overlay else "") + (
         "; progress ring" if ring else "") + (
         f"; outro {plan.outro.path.name} x{plan.outro.speed:.2f} ({plan.outro.seconds:.1f}s)"
-        if plan.outro else "") + ("; moving pattern" if plan.pattern else "")
+        if plan.outro else "") + ("; moving pattern" if plan.pattern else "") + (
+        "; verse card(s) " + ", ".join(f"{c.reference} {c.start:.1f}-{c.end:.1f}s" for c in plan.cards)
+        if plan.cards else "")
     log.info("framing %s: window %dx%d at (%d,%d) in %dx%d%s", src.name, rect[2], rect[3], rect[0], rect[1],
              style.width, style.height, notes)
     try:
@@ -386,6 +435,8 @@ def render_video(src: Path, out: Path, style: FrameStyle, info: MediaInfo, work_
         layer_path.unlink(missing_ok=True)
         mask_path.unlink(missing_ok=True)
         pmask_path.unlink(missing_ok=True)
+        for p in card_paths:
+            p.unlink(missing_ok=True)
         shutil.rmtree(ring_dir, ignore_errors=True)
     if result.returncode != 0:
         out.unlink(missing_ok=True)

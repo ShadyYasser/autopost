@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -124,10 +125,13 @@ class EditPlan:
     progress: ProgressStyle | None = None
     outro: OutroSpec | None = None
     pattern: PatternSpec | None = None
+    cards: list[Any] = field(default_factory=list)                 # verses.VerseCard, times in the source
+    card_blur: float = 26.0
 
     def __bool__(self) -> bool:
         return (self.hook is not None or bool(self.zoom) or self.overlay is not None
-                or self.progress is not None or self.outro is not None or self.pattern is not None)
+                or self.progress is not None or self.outro is not None or self.pattern is not None
+                or bool(self.cards))
 
     @property
     def hook_seconds(self) -> float:

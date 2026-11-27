@@ -508,16 +508,25 @@ class OutroConfig(_Model):
     max_speed: float = Field(2.5, ge=1.0, le=4.0)
 
 
+class VersesConfig(_Model):
+    """Verse cards: while the speaker reads a Bible verse, the reel is blurred and a card shows the verse as the
+    Smith-Van Dyck translation prints it, with its reference. Found by matching the Whisper transcript against
+    the real text (src/autopost/verses.py): a paraphrase or an unsure match gets no card. Needs the audio check."""
+    enabled: bool = True
+    blur: float = Field(26.0, ge=4, le=80)
+
+
 class EditsConfig(_Model):
-    """Edits applied while the video is framed; no text is ever added to the picture. All of them need
-    `frame`. `hook` and `zoom` are cut from the reel itself and additionally need the audio check on the
-    stream, because their timestamps come from the Whisper transcript."""
+    """Edits applied while the video is framed. All of them need `frame`. `hook` and `zoom` are cut from the
+    reel itself and, like `verses` (the only edit that adds text: verbatim Bible verses), need the audio check
+    on the stream, because their timestamps come from the Whisper transcript."""
     hook: HookConfig | None = None
     zoom: ZoomConfig | None = None
     overlay: OverlayConfig | None = None
     progress: ProgressConfig | None = None
     outro: OutroConfig | None = None
     pattern: PatternConfig | None = None
+    verses: VersesConfig | None = None
 
 
 class AudioCheckConfig(_Model):
@@ -744,7 +753,7 @@ def validate_brand(brand: BrandConfig, settings: Settings) -> list[str]:
             e = stream.edits
             if not stream.frame:
                 errors.append(f"{sp}: `edits` needs `frame` (the edits are made while the video is framed)")
-            if (e.hook or e.zoom) and not (brand.title_guard and brand.title_guard.enabled
+            if (e.hook or e.zoom or (e.verses and e.verses.enabled)) and not (brand.title_guard and brand.title_guard.enabled
                                            and brand.title_guard.audio_for(name)):
                 errors.append(f"{sp}: edits.hook/zoom need title_guard.audio on this stream "
                               f"(their times come from the transcript)")

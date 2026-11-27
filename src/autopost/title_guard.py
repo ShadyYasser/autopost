@@ -139,6 +139,24 @@ sects, no generic tags like "دين" or "فيديو".
 Reply with ONLY one JSON object, no other text:
 {{"tags": ["<tag>", ...]}}"""
 
+VERSES_SYSTEM_PROMPT = """You check Bible verse cards for short Arabic reels on the channel "كلمة سواء": an \
+educational, interfaith-dialogue page (Islam, Christianity and comparative religion).
+{context}
+While the speaker reads a Bible verse, the reel shows a card with that verse. You get one JSON object: \
+{{"transcript": "...", "candidates": [{{"n": 1, "reference": "...", "verse": "...", "said": "..."}}, ...]}}. The \
+transcript is automatic speech-to-text of spoken Arabic (often Egyptian dialect) and has recognition mistakes. Each \
+candidate is a verse (exact Smith-Van Dyck text) that automatic matching found in the speech, and "said" is what \
+the speaker says at that moment.
+
+Keep a candidate ONLY when, reading the whole transcript, the speaker really reads out or quotes THIS verse as \
+scripture at that moment (words of the verse itself, or its reference said out loud with the verse), so a card \
+showing it would be correct and helpful. Drop it when the overlap is a coincidence, when he paraphrases another \
+passage, when the words belong to a different verse with similar wording, or when you are not sure. Dropping is \
+normal and safe; never keep a candidate you have doubts about.
+
+Reply with ONLY one JSON object, no other text:
+{{"keep": [<numbers of the candidates to keep>], "reason": "<short English reason>"}}"""
+
 HOOK_SYSTEM_PROMPT = """You choose the opening line of short Arabic reels on the channel "كلمة سواء": an \
 educational, interfaith-dialogue page (Islam, Christianity and comparative religion).
 {context}
@@ -434,7 +452,7 @@ class TitleGuard:
                 self.sleep(2 ** attempt * 2)
         raise GuardError(f"{what} failed: {last}")
 
-    def _ask_parsed(self, system: str, user: str, max_tokens: int, what: str, parse):
+    def _ask_parsed(self, system: str, user: str, max_tokens: int, what: str, parse, note: str | None = None):
         """Ask and parse. A reply that cannot be parsed (no JSON, no valid "risk") is asked once more with a
         reminder: the local model answers at temperature 0, so the same question would get the same reply."""
         text = self._ask(system, user, max_tokens, what)
@@ -442,7 +460,7 @@ class TitleGuard:
             return parse(text)
         except GuardError as exc:
             log.warning("%s: unusable reply (%s); asking once more", what, exc)
-        text = self._ask(system, user + RETRY_NOTE, max_tokens, what)
+        text = self._ask(system, user + (note or RETRY_NOTE), max_tokens, what)
         return parse(text)
 
     def judge(self, title: str) -> Verdict:
@@ -467,6 +485,23 @@ class TitleGuard:
         payload = json.dumps({"title": title, "transcript": transcript[:MAX_TRANSCRIPT]}, ensure_ascii=False)
         text = self._ask(TAGS_SYSTEM_PROMPT.format(context=self._ctx, count=count), payload, 200, "hashtags")
         return clean_tags(_json_object(text).get("tags"), f"{title} {transcript}", count)
+
+    def confirm_verses(self, transcript: str, candidates: list[dict]) -> list[int]:
+        """0-based indexes of the candidate verse cards the speaker really quotes. The model only keeps or drops
+        candidates (their text comes from the Bible, never from the model)."""
+        if not candidates:
+            return []
+        payload = json.dumps({"transcript": " ".join(transcript.split())[:MAX_TRANSCRIPT],
+                              "candidates": [{"n": i, **c} for i, c in enumerate(candidates, 1)]},
+                             ensure_ascii=False)
+
+        def parse(text: str) -> list[int]:
+            keep = _json_object(text).get("keep")
+            if not isinstance(keep, list):
+                raise GuardError("no keep list in the reply")
+            return sorted({int(k) - 1 for k in keep if str(k).isdigit() and 1 <= int(k) <= len(candidates)})
+        return self._ask_parsed(VERSES_SYSTEM_PROMPT.format(context=self._ctx), payload, 300, "verse check", parse,
+                                note='\n\nReply with ONE JSON object only: {"keep": [...], "reason": "..."}.')
 
     def pick_hook(self, title: str, transcript: str, candidates: list[str]) -> int | None:
         """Index (0-based) of the candidate sentence to play as the cold open, or None when none is safe."""
