@@ -299,3 +299,17 @@ def test_numbering_report_finds_gaps_duplicates_and_unnumbered():
     assert format_ranges(rep["gaps"]) == "3-4, 7-8"
     assert rep["duplicates"] == {6: ["6 (1).mp4", "6.mp4"]}
     assert rep["unnumbered"] == ["intro.mp4"]
+
+
+def test_label_order_and_title_without_label(app, tmp_path):
+    from autopost.content.drive_source import order_by_label
+    names = ["C - x.mp4", "G - y.mp4", "4 - z.mp4", "B - v.mp4", "10 - q.mp4", "plain.mp4"]
+    ordered = order_by_label([VideoItem(id=n, name=n, created=None) for n in names])
+    assert [v.name for v in ordered] == ["4 - z.mp4", "10 - q.mp4", "B - v.mp4", "C - x.mp4", "G - y.mp4", "plain.mp4"]
+    content, _, _ = make(app, tmp_path)
+    content.app.brands["kalima_sawaa"].title_guard.enabled = False
+    v = VideoItem(id="o1", name="C - مسيحي بياخد من الكتاب اللي على مزاجه! 😅.mp4", created=None)
+    content._stream_of["o1"] = ("kalima_sawaa", "own")
+    assert content.pick_text("kalima_sawaa", "own", v).variables["title"] == "مسيحي بياخد من الكتاب اللي على مزاجه! 😅"
+    content._stream_of["o1"] = ("kalima_sawaa", "short")                     # other streams keep the name as is
+    assert content.pick_text("kalima_sawaa", "short", v).variables["title"].startswith("C - ")
