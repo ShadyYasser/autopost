@@ -183,6 +183,7 @@ class DriveContent:
         self._guard_session = guard_session
         self._guard_backend = guard_backend            # tests: replaces the model of every brand
         self._transcriber = transcriber                # tests: replaces Whisper
+        self._screen: dict[str, list[tuple[float, str]]] = {}   # video id -> OCR of its frames (this run only)
         self.audio_check = audio_check and not dry_run  # dry runs never download and transcribe
         self._guards: dict[str, TitleGuard] = {}
         self._local_backends: dict[tuple[str, str, int], LocalBackend] = {}
@@ -359,6 +360,80 @@ class DriveContent:
     def _segs_key(self, brand: str, video: VideoItem) -> str:
         return self._guard_key(brand, video)[0].replace("guard:", "audio:segs:", 1)
 
+    def _verses_key(self, brand: str, video: VideoItem) -> str:
+        return self._guard_key(brand, video)[0].replace("guard:", "guard:verses:", 1)
+
+    def verses_wanted(self, brand: str, stream: str) -> bool:
+        e = self.edits_for(brand, stream)
+        return bool(e and e.verses and e.verses.enabled and self.audio_on(brand, stream))
+
+    def _read_screen(self, brand: str, video: VideoItem, path: Path) -> None:
+        """OCR of the downloaded original, kept for this run only (the cards made from it go to state)."""
+        from ..screen_text import ScreenTextError, read_screen
+        try:
+            self._screen[video.id] = read_screen(path, self.app.brands[brand].title_guard.audio.max_seconds)
+        except (ScreenTextError, OSError) as exc:
+            log.warning("screen text of %s not read: %s", video.name, exc)
+
+    def verse_cards(self, brand: str, stream: str, video: VideoItem, duration: float,
+                    path: Path | None = None) -> list:
+        """Verse cards of this reel (cached in state): the creator's own on-screen verse cards (OCR), then verses
+        read out that the language model confirms. Cosmetic: any failure means no card, never a wrong one, and
+        nothing is cached so the next run tries again."""
+        if not self.verses_wanted(brand, stream):
+            return []
+        from .. import verses
+        key = self._verses_key(brand, video)
+        raw = self.state.kv_get(key)
+        if raw is not None:
+            try:
+                return [c for c in (verses.VerseCard.from_json(d) for d in json.loads(raw)) if c.start < duration - 0.5]
+            except (ValueError, KeyError, TypeError):
+                pass
+        segments = self.cached_segments(brand, video)
+        if segments is None:
+            return []
+        if video.id not in self._screen:
+            if path is None:
+                suffix = Path(video.name).suffix.lower() or ".mp4"
+                dest = self.work_dir / f"{video.id}.ocr{suffix}"
+                try:
+                    self.client.download(video.id, dest, video.size)
+                    self._read_screen(brand, video, dest)
+                except GoogleError as exc:
+                    log.warning("verse cards for %s skipped: %s", video.name, exc)
+                finally:
+                    dest.unlink(missing_ok=True)
+            else:
+                self._read_screen(brand, video, path)
+        if video.id not in self._screen:
+            return []
+        try:
+            bible = verses.load_bible()
+            screen = verses.cards_from_screen(self._screen[video.id], segments, bible)
+            speech = [c for c in verses.speech_candidates(segments, bible)
+                      if not any(not (c.end <= s.start or c.start >= s.end) for s in screen)]
+            if speech:
+                said = [" ".join(s.text for s in segments if s.end >= c.start and s.start <= c.end) for c in speech]
+                keep = self.guard_for(brand).confirm_verses(
+                    self.transcript(brand, video),
+                    [{"reference": c.reference, "verse": c.text, "said": t} for c, t in zip(speech, said)])
+                dropped = [c.reference for i, c in enumerate(speech) if i not in keep]
+                if dropped:
+                    log.info("verse cards %s: the model dropped %s", video.name, ", ".join(dropped))
+                speech = [c for i, c in enumerate(speech) if i in keep]
+            cards = verses.combine(screen, speech)
+        except GuardError as exc:
+            log.warning("verse cards for %s skipped (model): %s", video.name, exc)
+            return []
+        except Exception as exc:  # noqa: BLE001 - download or data trouble: the reel goes out without cards
+            log.warning("verse cards for %s skipped: %s", video.name, exc)
+            return []
+        self.state.kv_set(key, json.dumps([c.to_json() for c in cards], ensure_ascii=False))
+        log.info("verse cards %s: %s", video.name,
+                 "; ".join(f"{c.reference} [{c.source}] {c.start:.1f}-{c.end:.1f}s" for c in cards) or "none")
+        return [c for c in cards if c.start < duration - 0.5]
+
     def _hook_key(self, brand: str, video: VideoItem) -> str:
         return self._guard_key(brand, video)[0].replace("guard:", "guard:hook:", 1)
 
@@ -372,6 +447,9 @@ class DriveContent:
             self.client.download(video.id, dest, video.size)
             timed = getattr(transcriber, "transcribe_segments", None)
             text, segments = timed(dest, self.work_dir) if timed else (transcriber.transcribe(dest, self.work_dir), [])
+            where = self._stream_of.get(video.id)
+            if where and where[0] == brand and self.verses_wanted(*where) and video.id not in self._screen:
+                self._read_screen(brand, video, dest)           # same download: the verse cards need the frames
         except (GoogleError, TranscribeError) as exc:
             raise ContentError(f"{video.name}: audio check failed: {exc}") from exc
         finally:
@@ -523,8 +601,9 @@ class DriveContent:
             return False
         return self.hook_wanted(brand, stream) is None or self.cached_hook(brand, video) is not False
 
-    def edit_plan(self, video: VideoItem, duration: float) -> EditPlan | None:
-        """The edits of this video from what is cached in state (never calls a model, never transcribes)."""
+    def edit_plan(self, video: VideoItem, duration: float, source: Path | None = None) -> EditPlan | None:
+        """The edits of this video from what is cached in state. Only verse cards not cached yet are worked out
+        here (OCR of `source`, the downloaded original, and the model check)."""
         where = self._stream_of.get(video.id)
         e = self.edits_for(*where) if where else None
         if e is None:
@@ -548,9 +627,12 @@ class DriveContent:
         pattern = None
         if e.pattern and e.pattern.enabled and resolve_asset(e.pattern.path).is_file():
             pattern = PatternSpec(resolve_asset(e.pattern.path), color=e.pattern.color, opacity=e.pattern.opacity)
+        cards = [dataclasses.replace(c, end=min(c.end, duration)) for c in
+                 self.verse_cards(brand, stream, video, duration, path=source)]
         plan = EditPlan(hook=hook, zoom=zoom, zoom_factor=e.zoom.factor if e.zoom else 1.0,
                         overlay=self.overlay_for(brand, stream, video), progress=progress,
-                        outro=self.outro_for(brand, stream, body), pattern=pattern)
+                        outro=self.outro_for(brand, stream, body), pattern=pattern, cards=cards,
+                        card_blur=e.verses.blur if e.verses else 26.0)
         return plan if plan else None
 
     def audio_verdict(self, brand: str, stream: str, video: VideoItem) -> AudioVerdict:
@@ -646,6 +728,7 @@ class DriveContent:
                 return ("title", new.risk, verdict.original, new.reasons or verdict.reasons)
         self.topical_tags(brand, stream, video)
         self.plan_edits(brand, stream, video)
+        self.verse_cards(brand, stream, video, float("inf"))
         return None
 
     def checked(self, brand: str, stream: str, video: VideoItem) -> bool:
@@ -767,6 +850,7 @@ class DriveContent:
                 break
             if self.checked(brand, stream, video):
                 stats["already"] += 1
+                self.verse_cards(brand, stream, video, float("inf"))   # cosmetic, cached: reels checked earlier
                 continue
             held = self.screen(brand, stream, video)
             stats["checked"] += 1
@@ -803,7 +887,7 @@ class DriveContent:
             original = self.client.download(video.id, dest, video.size)
             if style is not None:
                 before = probe(original)
-                plan = self.edit_plan(video, before.duration_s)
+                plan = self.edit_plan(video, before.duration_s, source=original)
                 prepared = render_video(original, self.work_dir / f"{video.id}.framed.mp4", style, before,
                                         self.work_dir, self.encode.timeout_seconds, plan=plan)
                 after = probe(prepared)
