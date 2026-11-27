@@ -584,7 +584,9 @@ class StreamConfig(_Model):
     #   Ties (same createdTime) are broken by the Telegram msg_id of tg2drive files, then the name.
     # name_number: by the number in the file name (2 before 10); files without a number come after.
     # newest_first: highest Telegram msg_id first (tg2drive files), then newest createdTime.
-    order: Literal["created_time", "name_number", "newest_first"] = "created_time"
+    # label: files named "<label> - title" (e.g. "B - ...", "4 - ..."): numbers first, then letters, then files
+    #   without a label (oldest upload first); the label is removed from the title.
+    order: Literal["created_time", "name_number", "newest_first", "label"] = "created_time"
     slots: list[str] = Field(min_length=1)
     platforms: list[PlatformName] = Field(min_length=1)
     overrides: dict[PlatformName, dict[str, Any]] = Field(default_factory=dict)
